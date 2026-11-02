@@ -117,11 +117,19 @@ def int_digits_exceed(x: int, max_digits: int) -> bool:
     """
     if x == 0:
         return max_digits < 1
-    bl = (-x if x < 0 else x).bit_length()
-    # digits(2^(bl-1)) = floor((bl-1)*log10(2)) + 1  — exact lower bound.
-    digits_min = ((bl - 1) * 30103) // 100000 + 1
-    if digits_min > max_digits:
+    ax = -x if x < 0 else x
+    bl = ax.bit_length()
+    # log10(2) = 0.30102999566... Use an UNDER-estimate (0.30102) for the
+    # lower bound and an OVER-estimate (0.30103) for the upper bound, so
+    # both bounds are safe; the window between them (≈ bl*1e-5 digits)
+    # falls back to one exact big-int comparison. (An earlier version
+    # used 0.30103 for the lower bound — an over-estimate of log10(2) —
+    # which falsely rejected in-limit values such as 1<<100000 with
+    # max_digits=30103.)
+    digits_lb = ((bl - 1) * 30102) // 100000 + 1   # ≤ true digit count
+    digits_ub = (bl * 30103) // 100000 + 1          # ≥ true digit count
+    if digits_lb > max_digits:
         return True
-    if digits_min == max_digits:
-        return (-x if x < 0 else x) >= 10 ** max_digits
-    return False
+    if digits_ub <= max_digits:
+        return False
+    return ax >= 10 ** max_digits

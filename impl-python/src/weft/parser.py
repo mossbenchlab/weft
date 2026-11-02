@@ -11,9 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Iterator, List, Optional
 
+from ._trampoline import drive as _drive
 from .errors import WeftSyntaxError, WeftLimitError
-import sys as _sys
-import contextlib as _contextlib
 from .lexer import (
     Lexer, Token,
     TK_LPAREN, TK_RPAREN, TK_LBRACK, TK_RBRACK, TK_LBRACE, TK_RBRACE,
@@ -114,6 +113,14 @@ class _Parser:
     # --- grammar ---
 
     def parse_value(self) -> Any:
+        """Parse one value. Iterative: the recursive-descent grammar runs
+        as generators on an explicit stack (see weft._trampoline), so
+        document depth never consumes host call-stack frames — any depth
+        the §9 limits admit parses without touching the interpreter
+        recursion limit."""
+        return _drive(self._parse_value_gen())
+
+    def _parse_value_gen(self):
         tok = self.peek()
         if tok is None:
             raise WeftSyntaxError(
@@ -161,11 +168,11 @@ class _Parser:
             # Keywords only make sense inside collections; a top-level keyword
             # is syntactically fine but the caller must handle it.
         elif tok.kind == TK_LPAREN:
-            value = self._parse_sexpr(tok)
+            value = yield self._parse_sexpr(tok)
         elif tok.kind == TK_LBRACK:
-            value = self._parse_list(tok)
+            value = yield self._parse_list(tok)
         elif tok.kind == TK_LBRACE:
-            value = self._parse_map(tok)
+            value = yield self._parse_map(tok)
         else:
             raise self.error(
                 f"unexpected token {tok.kind} while parsing value",
@@ -181,7 +188,7 @@ class _Parser:
             self.advance()
             self._enter()
             annot_count += 1
-            type_expr = self._parse_type_expr()
+            type_expr = yield self._parse_type_expr()
             value = Typed(value=value, type=type_expr)
             self._bump_total()
             nxt = self.peek()
@@ -215,7 +222,7 @@ class _Parser:
                 if t.kind == TK_RPAREN:
                     self.advance()
                     break
-                items.append(self.parse_value())
+                items.append((yield self._parse_value_gen()))
                 if len(items) > self.limits.max_items_per_coll:
                     raise WeftLimitError(
                         f"S-expression has more items than "
@@ -241,7 +248,7 @@ class _Parser:
                 if t.kind == TK_RBRACK:
                     self.advance()
                     break
-                items.append(self.parse_value())
+                items.append((yield self._parse_value_gen()))
                 if len(items) > self.limits.max_items_per_coll:
                     raise WeftLimitError(
                         f"list has more items than "
@@ -282,7 +289,7 @@ class _Parser:
                         f"map key :{key_name} has no value",
                         tok=t, code="WEFT_SYNTAX_MAP_VALUE",
                     )
-                value = self.parse_value()
+                value = yield self._parse_value_gen()
                 if key_name in d:
                     raise self.error(
                         f"duplicate map key :{key_name}",
@@ -311,7 +318,7 @@ class _Parser:
             self.advance()
             return Symbol(tok.value)  # type: ignore[arg-type]
         if tok.kind == TK_LPAREN:
-            s = self._parse_sexpr(tok)
+            s = yield self._parse_sexpr(tok)
             return s
         raise self.error(
             f"type expression must be a symbol or S-expression, got {tok.kind}",
@@ -432,34 +439,6 @@ def _strip_types(value: Any) -> Any:
     return value
 
 
-# Frames of Python recursion per Weft nesting level in _Parser (measured
-# with margin). parse()/parse_stream() raise the interpreter recursion
-# limit so every depth the §9 ``max_depth`` setting admits can actually
-# be parsed; a RecursionError that still escapes (hostile frame budget,
-# tiny host stack) surfaces as WEFT_LIMIT_DEPTH, never a host crash.
-_FRAMES_PER_LEVEL = 16
-
-
-@_contextlib.contextmanager
-def _recursion_headroom(max_depth: int):
-    needed = max_depth * _FRAMES_PER_LEVEL + 512
-    old = _sys.getrecursionlimit()
-    raised = needed > old
-    if raised:
-        _sys.setrecursionlimit(needed)
-    try:
-        try:
-            yield
-        except RecursionError:
-            raise WeftLimitError(
-                f"nesting depth exceeds what this host can parse "
-                f"(max_depth={max_depth} admitted it, but the interpreter "
-                f"stack did not)", code="WEFT_LIMIT_DEPTH") from None
-    finally:
-        if raised:
-            _sys.setrecursionlimit(old)
-
-
 def parse(
     text: str,
     *,
@@ -490,8 +469,7 @@ def parse(
             "empty document: single-value mode requires exactly one top-level value",
             code="WEFT_SYNTAX_EMPTY",
         )
-    with _recursion_headroom(limits.max_depth):
-        value = p.parse_value()
+    value = p.parse_value()
     leftover = p.peek()
     if leftover is not None:
         raise WeftSyntaxError(
@@ -521,8 +499,7 @@ def parse_stream(
     p = _Parser(toks, limits=limits, source_text=text)
     values: list = []
     while p.peek() is not None:
-        with _recursion_headroom(limits.max_depth):
-            v = p.parse_value()
+        v = p.parse_value()
         _check_tree_depth(v, limits.max_depth)
         if strip_types:
             v = _strip_types(v)

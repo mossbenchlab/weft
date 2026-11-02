@@ -1,91 +1,142 @@
-"""Linear-time pattern matching for schema ``:pattern`` (SPEC §8).
+"""Linear-time pattern matching for Weft-Schema ``:pattern``
+(normative grammar: spec/SCHEMA-PATTERN.md).
 
 This is a Thompson-NFA engine: the pattern is compiled once into a
 graph of at most ``MAX_NODES`` nodes, and matching simulates the node
-set over the input — worst case O(len(text) * nodes), with **no
-backtracking and no timeouts**. A hostile pattern therefore cannot
-stall the caller, which a wall-clock timeout around a backtracking
-host engine cannot guarantee (the host match holds the GIL / the
-event loop and the timer never fires).
+set over the input — **no backtracking and no timeouts**. A hostile
+pattern therefore cannot stall the caller, which a wall-clock timeout
+around a backtracking host engine cannot guarantee.
 
-Supported syntax (the SPEC §8 pattern subset — identical in every
-reference implementation):
+Hostile *patterns* are part of the threat model, not just hostile
+inputs, so compilation itself is defended:
+
+* the pattern source is capped at ``MAX_PATTERN_LEN`` code points;
+* group nesting is capped at ``MAX_GROUP_DEPTH`` (the compiler is
+  recursive-descent — without the cap a paren run would exhaust the
+  host stack);
+* ``{m,n}`` counters are lexed as ASCII digits only, length-capped
+  *before* integer conversion, and bounded by ``MAX_REPEAT``;
+* ``\\u{...}`` escapes are lexed as 1–6 ASCII hex digits only — host
+  ``int()`` leniency (``+``, ``_``, non-ASCII digits) never reaches
+  the pattern grammar;
+* character-class ranges are sorted and coalesced at compile time and
+  matched by binary search, so a class like ``[aaa...a]`` costs
+  O(log r) per input character, never O(r);
+* every diagnostic is a ``WeftSchemaError`` (``WEFT_SCHEMA_PATTERN``)
+  — host exceptions do not escape.
+
+Matching cost is O(len(text) × active_states × log ranges), with
+active_states ≤ MAX_NODES. For a fixed pattern this is linear in the
+input length.
+
+Supported syntax (identical list in spec/SCHEMA-PATTERN.md):
 
 * literals, ``.`` (any code point except LF)
-* escapes: ``\\d \\D \\w \\W \\s \\S \\n \\t \\r \\f \\v``,
-  ``\\xHH``, ``\\uHHHH``, ``\\u{HEX}``, and escaped metacharacters
+* escapes: ``\\d \\D \\w \\W \\s \\S \\n \\t \\r \\f \\v \\0``,
+  ``\\xHH``, ``\\uHHHH``, ``\\u{HEX}``, and escaped punctuation
 * character classes ``[...]`` / ``[^...]`` with ranges
 * quantifiers ``* + ? {m} {m,} {m,n}`` (an appended ``?`` is accepted
   and ignored — greediness cannot change a boolean full match)
 * alternation ``|``; groups ``(...)`` and ``(?:...)``
 * anchors ``^`` (start) and ``$`` (end)
 
-Deliberately **not** supported (rejected at compile time with
-``WEFT_SCHEMA_PATTERN``): backreferences, lookaround, named groups,
-inline flags. ``\\d \\w \\s`` are the ASCII sets ``[0-9]``,
-``[A-Za-z0-9_]``, ``[ \\t\\n\\r\\f\\v]`` — pinned so every host
-matches identical strings.
+Deliberately **not** supported (rejected at compile time):
+backreferences, lookaround, named groups, inline flags.
+``\\d \\w \\s`` are the ASCII sets ``[0-9]``, ``[A-Za-z0-9_]``,
+``[ \\t\\n\\r\\f\\v]`` — pinned so every host matches identically.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from typing import List, Optional, Tuple
 
 from .errors import WeftSchemaError
 
 MAX_NODES = 10000
-# {m,n} repetition is expanded structurally; cap the counters so the
-# expansion cannot be used to blow up the compiled size.
 MAX_REPEAT = 1000
+MAX_PATTERN_LEN = 10000
+MAX_GROUP_DEPTH = 64
 
 # Node kinds
-_CHAR = 0      # match one code point in `ranges`, goto next
-_SPLIT = 1     # epsilon to out1 and out2
-_MATCH = 2     # accept
+_CHAR = 0        # match one code point in `ranges`, goto nxt
+_SPLIT = 1       # epsilon to out1 and out2
+_MATCH = 2       # accept
 _ASSERT_BOL = 3  # epsilon, only at position 0
 _ASSERT_EOL = 4  # epsilon, only at end of input
 
-_D = (("0", "9"),)
-_W = (("0", "9"), ("A", "Z"), ("a", "z"), ("_", "_"))
-_S = ((" ", " "), ("\t", "\t"), ("\n", "\n"), ("\r", "\r"),
-      ("\x0b", "\x0b"), ("\x0c", "\x0c"))
-
 _MAX_CP = 0x10FFFF
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ASCII_DIGITS = frozenset("0123456789")
+
+# ASCII class sets as (lo, hi) code-point pairs.
+_D = ((0x30, 0x39),)
+_W = ((0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A))
+_S = ((0x09, 0x0D), (0x20, 0x20))  # \t \n \v \f \r and space
 
 
 def _err(msg: str) -> WeftSchemaError:
     return WeftSchemaError(msg, code="WEFT_SCHEMA_PATTERN")
 
 
-def _negate(ranges: Tuple[Tuple[str, str], ...]) -> Tuple[Tuple[str, str], ...]:
-    pts = sorted((ord(a), ord(b)) for a, b in ranges)
-    out: List[Tuple[str, str]] = []
+def _merge(ranges) -> Tuple[Tuple[int, int], ...]:
+    """Sort and coalesce (lo, hi) pairs into disjoint ascending ranges."""
+    pts = sorted(ranges)
+    out: List[Tuple[int, int]] = []
+    for lo, hi in pts:
+        if out and lo <= out[-1][1] + 1:
+            if hi > out[-1][1]:
+                out[-1] = (out[-1][0], hi)
+        else:
+            out.append((lo, hi))
+    return tuple(out)
+
+
+def _negate(ranges) -> Tuple[Tuple[int, int], ...]:
+    merged = _merge(ranges)
+    out: List[Tuple[int, int]] = []
     prev = 0
-    for a, b in pts:
-        if a > prev:
-            out.append((chr(prev), chr(a - 1)))
-        prev = max(prev, b + 1)
+    for lo, hi in merged:
+        if lo > prev:
+            out.append((prev, lo - 1))
+        prev = max(prev, hi + 1)
     if prev <= _MAX_CP:
-        out.append((chr(prev), chr(_MAX_CP)))
+        out.append((prev, _MAX_CP))
     return tuple(out)
 
 
 class _Node:
-    __slots__ = ("kind", "ranges", "nxt", "out1", "out2")
+    __slots__ = ("kind", "lows", "highs", "nxt", "out1", "out2")
 
     def __init__(self, kind: int):
         self.kind = kind
-        self.ranges: Tuple[Tuple[str, str], ...] = ()
+        self.lows: List[int] = []
+        self.highs: List[int] = []
         self.nxt = -1
         self.out1 = -1
         self.out2 = -1
 
+    def set_ranges(self, ranges) -> None:
+        merged = _merge(ranges)
+        self.lows = [lo for lo, _ in merged]
+        self.highs = [hi for _, hi in merged]
+
+    def matches(self, o: int) -> bool:
+        i = bisect_right(self.lows, o) - 1
+        return i >= 0 and self.highs[i] >= o
+
 
 class Pattern:
-    """A compiled SPEC §8 pattern. ``fullmatch(text)`` is linear-time."""
+    """A compiled schema pattern. ``fullmatch(text)`` is linear-time in
+    ``text`` for a fixed pattern and raises nothing."""
 
     def __init__(self, source: str):
+        if not isinstance(source, str):
+            raise _err("pattern must be a string")
+        if len(source) > MAX_PATTERN_LEN:
+            raise _err(f"pattern longer than {MAX_PATTERN_LEN} code points")
         self.source = source
         self._nodes: List[_Node] = []
+        self._group_depth = 0
         self._start = self._compile(source)
 
     # --- compilation ------------------------------------------------
@@ -107,8 +158,7 @@ class Pattern:
         self._patch(outs, m)
         return start
 
-    # A fragment is (start_node, [(node_index, slot)]) where slot is
-    # "nxt"/"out1"/"out2" dangling arrows to patch.
+    # A fragment is (start_node, [(node_index, slot)]) — dangling arrows.
     def _patch(self, outs, target: int) -> None:
         for idx, slot in outs:
             setattr(self._nodes[idx], slot, target)
@@ -140,8 +190,6 @@ class Pattern:
                 break
             frags.append(self._repeat())
         if not frags:
-            # empty concatenation: a split node with both arrows dangling
-            # would loop; use an epsilon via SPLIT with one arrow.
             s = self._new(_SPLIT)
             return (s, [(s, "out1"), (s, "out2")])
         start, outs = frags[0]
@@ -172,16 +220,27 @@ class Pattern:
                 frag = self._opt(frag)
         if self._peek() == "?":  # lazy marker — irrelevant for a boolean match
             self._take()
-        if self._peek() in ("*", "+", "?", "{") and self._peek() != "{":
+        nxt = self._peek()
+        if nxt in ("*", "+", "?"):
             raise _err("nested bare quantifier (e.g. 'a++'); group the inner repeat")
         return frag
+
+    def _digits(self) -> str:
+        """Read a run of ASCII digits ('0'-'9' only — host .isdigit()
+        accepts non-ASCII digits that int() then rejects)."""
+        out = ""
+        while True:
+            ch = self._peek()
+            if ch is None or ch not in _ASCII_DIGITS:
+                return out
+            out += self._take()
+            if len(out) > 7:  # far beyond MAX_REPEAT; refuse before int()
+                raise _err(f"repeat count exceeds {MAX_REPEAT}")
 
     def _braces(self):
         # at '{'; returns (lo, hi) or (None, None) if not a counted repeat
         assert self._take() == "{"
-        digits = ""
-        while self._peek() is not None and self._peek().isdigit():
-            digits += self._take()
+        digits = self._digits()
         if self._peek() == "}":
             if not digits:
                 return (None, None)
@@ -194,9 +253,7 @@ class Pattern:
         self._take()
         lo = int(digits) if digits else 0
         self._check_rep(lo)
-        digits2 = ""
-        while self._peek() is not None and self._peek().isdigit():
-            digits2 += self._take()
+        digits2 = self._digits()
         if self._peek() != "}":
             return (None, None)
         self._take()
@@ -233,7 +290,6 @@ class Pattern:
     def _clone(self, frag):
         """Deep-copy a fragment (for counted repetition)."""
         start, outs = frag
-        # collect reachable nodes
         seen: dict = {}
         stack = [start]
         order = []
@@ -249,7 +305,8 @@ class Pattern:
             seen[i] = self._new(self._nodes[i].kind)
         for i in order:
             src, dst = self._nodes[i], self._nodes[seen[i]]
-            dst.ranges = src.ranges
+            dst.lows = src.lows
+            dst.highs = src.highs
             dst.nxt = seen.get(src.nxt, -1) if src.nxt >= 0 else -1
             dst.out1 = seen.get(src.out1, -1) if src.out1 >= 0 else -1
             dst.out2 = seen.get(src.out2, -1) if src.out2 >= 0 else -1
@@ -257,9 +314,6 @@ class Pattern:
         return (seen[start], new_outs)
 
     def _repeat_counted(self, frag, lo: int, hi: int):
-        # lo required copies, then either a star (open-ended) or
-        # (hi - lo) optional copies. The first part reuses `frag`
-        # itself; every further copy is a structural clone.
         parts = []
         used_orig = False
         for _ in range(lo):
@@ -285,24 +339,29 @@ class Pattern:
     def _atom(self):
         ch = self._take()
         if ch == "(":
-            if self._peek() == "?":
-                self._take()
-                nxt = self._peek()
-                if nxt == ":":
+            self._group_depth += 1
+            if self._group_depth > MAX_GROUP_DEPTH:
+                raise _err(f"group nesting exceeds {MAX_GROUP_DEPTH}")
+            try:
+                if self._peek() == "?":
                     self._take()
-                else:
-                    raise _err("only (?:...) groups are supported "
-                               "(no lookaround, flags, or named groups)")
-            frag = self._alt()
-            if self._peek() != ")":
-                raise _err("unterminated group")
-            self._take()
-            return frag
+                    if self._peek() == ":":
+                        self._take()
+                    else:
+                        raise _err("only (?:...) groups are supported "
+                                   "(no lookaround, flags, or named groups)")
+                frag = self._alt()
+                if self._peek() != ")":
+                    raise _err("unterminated group")
+                self._take()
+                return frag
+            finally:
+                self._group_depth -= 1
         if ch == "[":
             return self._charclass()
         if ch == ".":
             n = self._new(_CHAR)
-            self._nodes[n].ranges = _negate((("\n", "\n"),))
+            self._nodes[n].set_ranges(_negate(((0x0A, 0x0A),)))
             return (n, [(n, "nxt")])
         if ch == "^":
             n = self._new(_ASSERT_BOL)
@@ -311,22 +370,20 @@ class Pattern:
             n = self._new(_ASSERT_EOL)
             return (n, [(n, "nxt")])
         if ch == "\\":
-            return self._escape_atom()
+            ranges, negated = self._escape_ranges()
+            n = self._new(_CHAR)
+            self._nodes[n].set_ranges(_negate(ranges) if negated else ranges)
+            return (n, [(n, "nxt")])
         if ch in ")|*+?":
             raise _err(f"unexpected {ch!r}")
         n = self._new(_CHAR)
-        self._nodes[n].ranges = ((ch, ch),)
-        return (n, [(n, "nxt")])
-
-    def _escape_atom(self):
-        ranges, negated = self._escape_ranges()
-        n = self._new(_CHAR)
-        n_ = self._nodes[n]
-        n_.ranges = _negate(ranges) if negated else ranges
+        o = ord(ch)
+        self._nodes[n].set_ranges(((o, o),))
         return (n, [(n, "nxt")])
 
     def _escape_ranges(self):
-        """Consume one escape after '\\'. Returns (ranges, negated)."""
+        """Consume one escape after '\\'. Returns (ranges, negated)
+        where ranges are (lo, hi) code-point pairs."""
         if self._peek() is None:
             raise _err("dangling backslash")
         e = self._take()
@@ -342,42 +399,52 @@ class Pattern:
             return (_S, False)
         if e == "S":
             return (_S, True)
-        simple = {"n": "\n", "t": "\t", "r": "\r", "f": "\x0c", "v": "\x0b",
-                  "0": "\x00"}
+        simple = {"n": 0x0A, "t": 0x09, "r": 0x0D, "f": 0x0C, "v": 0x0B,
+                  "0": 0x00}
         if e in simple:
             c = simple[e]
             return (((c, c),), False)
         if e == "x":
-            h = self._hex(2)
-            c = chr(int(h, 16))
-            return (((c, c),), False)
+            cp = int(self._hex(2), 16)
+            return (((cp, cp),), False)
         if e == "u":
             if self._peek() == "{":
                 self._take()
                 h = ""
-                while self._peek() is not None and self._peek() != "}":
+                while True:
+                    ch = self._peek()
+                    if ch is None:
+                        raise _err("unterminated \\u{...} escape")
+                    if ch == "}":
+                        break
+                    if ch not in _HEX_DIGITS:
+                        raise _err(f"non-hex character {ch!r} in \\u{{...}} "
+                                   "escape (ASCII 0-9a-fA-F only)")
                     h += self._take()
-                if self._peek() != "}" or not (1 <= len(h) <= 6):
-                    raise _err("bad \\u{...} escape")
-                self._take()
+                    if len(h) > 6:
+                        raise _err("\\u{...} escape longer than 6 hex digits")
+                if not h:
+                    raise _err("empty \\u{...} escape")
+                self._take()  # '}'
             else:
                 h = self._hex(4)
             cp = int(h, 16)
             if cp > _MAX_CP or 0xD800 <= cp <= 0xDFFF:
                 raise _err("escape names an invalid code point")
-            c = chr(cp)
-            return (((c, c),), False)
-        if e.isdigit():
+            return (((cp, cp),), False)
+        if e in _ASCII_DIGITS:
             raise _err("backreferences are not supported")
         if e.isalpha():
             raise _err(f"unsupported escape \\{e}")
-        return (((e, e),), False)  # escaped metacharacter / punctuation
+        o = ord(e)
+        return (((o, o),), False)  # escaped metacharacter / punctuation
 
     def _hex(self, n: int) -> str:
         h = ""
         for _ in range(n):
-            if self._peek() is None or self._peek() not in "0123456789abcdefABCDEF":
-                raise _err("bad hex escape")
+            ch = self._peek()
+            if ch is None or ch not in _HEX_DIGITS:
+                raise _err("bad hex escape (ASCII 0-9a-fA-F only)")
             h += self._take()
         return h
 
@@ -386,8 +453,22 @@ class Pattern:
         if self._peek() == "^":
             self._take()
             negated = True
-        ranges: List[Tuple[str, str]] = []
+        ranges: List[Tuple[int, int]] = []
         first = True
+
+        def read_endpoint():
+            """Read one class element. Returns ('char', cp) for a single
+            code point or ('set', ranges) for a multi-char class escape."""
+            c = self._take()
+            if c == "\\":
+                rs, neg = self._escape_ranges()
+                if neg:
+                    rs = _negate(rs)
+                if len(rs) == 1 and rs[0][0] == rs[0][1]:
+                    return ("char", rs[0][0])
+                return ("set", rs)
+            return ("char", ord(c))
+
         while True:
             ch = self._peek()
             if ch is None:
@@ -396,36 +477,26 @@ class Pattern:
                 self._take()
                 break
             first = False
-            self._take()
-            if ch == "\\":
-                rs, neg = self._escape_ranges()
-                if neg:
-                    rs = _negate(rs)
-                if self._peek() == "-" and self._pos + 1 < len(self._src) \
-                        and self._src[self._pos + 1] != "]":
-                    raise _err("range endpoint cannot be a multi-char class")
-                ranges.extend(rs)
-                continue
-            lo = ch
+            kind, val = read_endpoint()
             if self._peek() == "-" and self._pos + 1 < len(self._src) \
                     and self._src[self._pos + 1] != "]":
+                if kind != "char":
+                    raise _err("range endpoint cannot be a multi-char class")
                 self._take()  # '-'
-                hi = self._take()
-                if hi == "\\":
-                    rs, neg = self._escape_ranges()
-                    if neg or len(rs) != 1 or rs[0][0] != rs[0][1]:
-                        raise _err("range endpoint cannot be a multi-char class")
-                    hi = rs[0][0]
-                if ord(hi) < ord(lo):
-                    raise _err(f"bad range {lo!r}-{hi!r}")
-                ranges.append((lo, hi))
+                kind2, val2 = read_endpoint()
+                if kind2 != "char":
+                    raise _err("range endpoint cannot be a multi-char class")
+                if val2 < val:
+                    raise _err(f"bad range {chr(val)!r}-{chr(val2)!r}")
+                ranges.append((val, val2))
+            elif kind == "char":
+                ranges.append((val, val))
             else:
-                ranges.append((lo, lo))
+                ranges.extend(val)
         if not ranges:
             raise _err("empty character class")
         n = self._new(_CHAR)
-        self._nodes[n].ranges = _negate(tuple(ranges)) if negated \
-            else tuple(ranges)
+        self._nodes[n].set_ranges(_negate(ranges) if negated else ranges)
         return (n, [(n, "nxt")])
 
     # --- simulation ---------------------------------------------------
@@ -437,22 +508,20 @@ class Pattern:
             if j < 0 or j in states:
                 continue
             node = self._nodes[j]
+            states.add(j)
             if node.kind == _SPLIT:
-                states.add(j)
                 stack.append(node.out1)
                 stack.append(node.out2)
             elif node.kind == _ASSERT_BOL:
-                states.add(j)
                 if pos == 0:
                     stack.append(node.nxt)
             elif node.kind == _ASSERT_EOL:
-                states.add(j)
                 if pos == end:
                     stack.append(node.nxt)
-            else:
-                states.add(j)
 
     def fullmatch(self, text: str) -> bool:
+        if not isinstance(text, str):
+            return False
         cps = list(text)
         end = len(cps)
         current: set = set()
@@ -462,11 +531,8 @@ class Pattern:
             o = ord(ch)
             for i in current:
                 node = self._nodes[i]
-                if node.kind == _CHAR:
-                    for a, b in node.ranges:
-                        if ord(a) <= o <= ord(b):
-                            self._add(nxt, node.nxt, pos + 1, end)
-                            break
+                if node.kind == _CHAR and node.matches(o):
+                    self._add(nxt, node.nxt, pos + 1, end)
             if not nxt:
                 return False
             current = nxt
@@ -474,6 +540,16 @@ class Pattern:
 
 
 def compile_pattern(source: str) -> Pattern:
-    """Compile a SPEC §8 pattern; raises WeftSchemaError
-    (WEFT_SCHEMA_PATTERN) on unsupported or oversized patterns."""
-    return Pattern(source)
+    """Compile a schema pattern; raises WeftSchemaError
+    (WEFT_SCHEMA_PATTERN) on invalid, unsupported, or oversized
+    patterns. Host exceptions never escape: anything unexpected is
+    converted to the same diagnostic."""
+    try:
+        return Pattern(source)
+    except WeftSchemaError:
+        raise
+    except (ValueError, OverflowError, RecursionError, MemoryError) as e:
+        # Belt and braces — the lexing above is strict, but any host
+        # exception that still slips through is a pattern diagnostic,
+        # never a crash in the caller.
+        raise _err(f"invalid pattern: {type(e).__name__}") from None

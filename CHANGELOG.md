@@ -192,3 +192,66 @@ verified by the four-implementation differential harness
   example now parses (the binary literal is `b"base64:..."`) and the
   fuzzer's atom list uses real syntax; `check_package.py` and the
   runners read files as UTF-8 explicitly (Windows cp932 default).
+
+## 1.0.1-rc3 (external review round 4 fixes)
+
+### Pattern engine hardening (Python schema validator)
+- Hostile patterns can no longer leak host exceptions or exhaust
+  resources at compile time: `\u{...}` escapes are lexed as 1–6 ASCII
+  hex digits only (no `int()` leniency — `+`, `_`, non-ASCII digits
+  rejected), `{m,n}` counters are ASCII-digit-only and length-capped
+  before conversion, group nesting is capped at 64, and the pattern
+  source is capped at 10,000 code points. Anything unexpected still
+  surfaces as `WEFT_SCHEMA_PATTERN`, never ValueError/RecursionError.
+- Character-class ranges are sorted and coalesced at compile time and
+  matched by binary search — `([aaa…a]|b)*` on a long input went from
+  non-terminating (within 3 s) to linear. A single-code-point escape
+  (`\x61`) is now a valid range endpoint; multi-char classes (`\d`)
+  still are not.
+- The normative subset, semantics and limits now live in
+  **spec/SCHEMA-PATTERN.md**; repat's docstring no longer points at the
+  wrong SPEC section.
+
+### Python: recursion eliminated, not raised
+- `sys.setrecursionlimit` is **never touched** anymore (the rc2 guard
+  raced across threads and could reject valid input or leave the limit
+  altered). The parser, pretty/strict formatters and `to_json(_lossless)`
+  now run as generators on an explicit heap stack (`weft._trampoline`),
+  and JSON text IO moved to a new iterative token-level reader/writer
+  (`weft.jsonio`) — the same lexical-reader design as the TS/Rust/Go
+  implementations, with duplicate-key rejection, digit limits, lone
+  surrogate rejection and structural caps applied **while reading**.
+  Any §9-admitted depth (verified at max_depth=1024) parses, formats,
+  and JSON-round-trips on every host, independent of interpreter
+  version or thread timing. Cost: the pure-Python JSON reader is ~20x
+  slower than the C stdlib scanner (~0.4 s / 1.3 MB) — the price of
+  conforming, interruption-free behavior in the reference impl.
+- `int_digits_exceed` used an over-estimate of log10(2) for its lower
+  bound and falsely rejected exact-boundary integers (e.g. `1<<100000`
+  with `max_int_digits=30103`); it now brackets with safe under/over
+  estimates and settles the window with one exact comparison.
+
+### TypeScript
+- The JSON reader's string "structural cap" is gone: input is already
+  bounded by `max_size_bytes`, and the cap wrongly rejected long
+  Symbol/Keyword/map-key identifiers that Weft's own text parser
+  accepts. Role-specific limits remain at conversion.
+- `fromJsonLossless` now applies `max_int_digits` to the direct
+  `bigint` branch (previously only number/JsonNum).
+
+### Rust / Go
+- One Weft value now bumps `max_total_items` exactly once: Rust's
+  scalar-tag bridge and Go's `*MapOrdered` re-dispatch no longer
+  double-count (`{"$sym":"a"}` loads under `max_total_items=1`).
+- Rust `from_json(_lossless)` decoded-number branches apply
+  `max_int_digits`.
+
+### Packaging / docs
+- LICENSE copyright: mossbenchlab. Go module path:
+  `github.com/mossbenchlab/weft/impl-go`.
+- §11.2.2 now references §7.1's NaN carve-out explicitly. SECURITY.md's
+  guarantees updated to cover pattern compilation, concurrency, and the
+  §9 JSON-interop limit semantics.
+- Self-tests: hostile-pattern battery, concurrent deep+shallow parse
+  check (recursion limit must stay untouched), digit-boundary checks,
+  long-identifier JSON roundtrip, total-items parity.

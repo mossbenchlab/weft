@@ -127,6 +127,67 @@ expect_err("raw DEL rejected", lambda: weft.parse('r"a\x7fb"'.replace("\\x7f", "
 expect_err("hex payload whitespace rejected",
            lambda: weft.loads_json('{"$bin": {"enc": "hex", "data": "00 00"}}'))
 
+# --- 1.0.1-rc3 regressions --------------------------------------------------
+# R4-1/2/3: hostile patterns are diagnostics, never host exceptions
+from weft.repat import compile_pattern
+from weft.errors import WeftSchemaError
+for bad in ["\\u{zz}", "\\u{-1}", "a{" + "9" * 4301 + "}",
+            "(" * 300 + "a" + ")" * 300, "\\u{+41}", "\\u{1_0}"]:
+    try:
+        compile_pattern(bad)
+        ok = bad == "a{²}"  # literal-brace semantics is fine
+    except WeftSchemaError:
+        ok = True
+    except Exception:
+        ok = False
+    check(f"pattern {bad[:12]!r} never leaks host exceptions", ok)
+check("hex escape works as range endpoint",
+      compile_pattern("[\\x61-z]").fullmatch("b"))
+import time as _t
+_t0 = _t.monotonic()
+check("duplicate-range class matches in linear time",
+      compile_pattern("([" + "a" * 5000 + "]|b)*").fullmatch("b" * 50000)
+      and _t.monotonic() - _t0 < 2.0)
+
+# R4-4: no process-global recursion-limit mutation, even under
+# concurrent parses of different depths
+import sys as _sys
+import threading as _th
+_base_limit = _sys.getrecursionlimit()
+_errors: list = []
+def _deep_parse():
+    try:
+        v = weft.parse("[" * 500 + "0" + "]" * 500, limits=Limits(max_depth=1024))
+        if weft.format_value(v, STRICT) == "":
+            _errors.append("empty")
+    except Exception as e:  # noqa: BLE001
+        _errors.append(repr(e))
+def _shallow_parse():
+    try:
+        for _ in range(200):
+            weft.parse("0", limits=Limits(max_depth=128))
+    except Exception as e:  # noqa: BLE001
+        _errors.append(repr(e))
+_threads = [ _th.Thread(target=_deep_parse) for _ in range(4) ] +            [ _th.Thread(target=_shallow_parse) for _ in range(4) ]
+for _x in _threads: _x.start()
+for _x in _threads: _x.join()
+check("concurrent deep+shallow parses all succeed", not _errors)
+check("recursion limit untouched after concurrent parses",
+      _sys.getrecursionlimit() == _base_limit)
+
+# R4-5: exact digit-count boundary on decoded integers
+check("1<<100000 accepted at its exact digit count (30103)",
+      weft.from_json(1 << 100000, limits=Limits(max_int_digits=30103)) == 1 << 100000)
+expect_err("1<<100000 rejected at 30102 digits",
+           lambda: weft.from_json(1 << 100000, limits=Limits(max_int_digits=30102)),
+           "WEFT_LIMIT_INT")
+
+# iterative JSON IO: admitted depth reads and writes on any host
+_deepdoc = weft.parse("[" * 1024 + "0" + "]" * 1024, limits=Limits(max_depth=1024))
+check("1024-deep dumps/loads cycle (iterative JSON IO)",
+      weft.equals(_deepdoc, weft.loads_json(weft.dumps_json(_deepdoc),
+                                            limits=Limits(max_depth=1024))))
+
 # --- int_max_str_digits immunity ----------------------------------------
 from weft.validators import dec_str_to_int
 check("chunked int conversion", dec_str_to_int("1" + "0" * 5000) == 10 ** 5000)

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	weft "github.com/homeaibase-design/weft/impl-go"
+	weft "github.com/mossbenchlab/weft/impl-go"
 )
 
 func must(cond bool, msg string) { if !cond { panic(msg) } }

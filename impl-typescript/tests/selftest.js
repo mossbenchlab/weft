@@ -94,6 +94,23 @@ check("$float payload 1e+20", JSON.stringify(weft.toJsonLossless(weft.parse("1e2
 // raw/triple DEL/C1 rejection
 expectErr("raw DEL rejected", () => weft.parse('r"a\u007fb"'.replace("\\u007f", "\u007f")));
 
+// --- 1.0.1-rc3 regressions ---------------------------------------------------
+// R4-6a: long identifiers survive JSON with tiny string/int limits
+{
+  const lim = weft.makeLimits({max_string_bytes: 1, max_int_digits: 1});
+  const sym = weft.parse("a".repeat(81), {limits: lim});
+  check("81-char symbol JSON roundtrip under tiny limits",
+    weft.equals(sym, weft.loadsJson(weft.dumpsJson(sym), {limits: lim})));
+}
+// R4-6b: bigint object entry obeys max_int_digits
+expectErr("fromJsonLossless bigint digit limit",
+  () => weft.fromJsonLossless(123n, weft.makeLimits({max_int_digits: 1})), "WEFT_LIMIT_INT");
+// R4-7 parity: one tagged scalar counts as one value
+{
+  const lim = weft.makeLimits({max_total_items: 1});
+  check("total=1 accepts one tagged scalar", weft.loadsJson('{"$str":"a"}', {limits: lim}) === "a");
+}
+
 console.log();
 if (fails) { console.log(fails + " FAILURES"); process.exit(1); }
 console.log("ALL TYPESCRIPT SELF-TESTS PASSED");

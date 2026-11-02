@@ -132,7 +132,7 @@ def _bigint_to_decimal_str(n: Any, max_int_digits: int) -> str:
 
 
 import dataclasses as _dataclasses
-from .parser import _recursion_headroom as _rec_headroom
+from ._trampoline import drive as _drive
 
 
 def format_value(value: Any, options: Optional[FormatOptions] = None) -> str:
@@ -152,10 +152,7 @@ def format_value(value: Any, options: Optional[FormatOptions] = None) -> str:
             strict_canonical=True,
             max_width=10**12,
         )
-    # The same stack headroom rule as parse(): any tree §9 limits admit
-    # (hard max_depth 1024) must format without a host RecursionError.
-    with _rec_headroom(1024):
-        rendered = _format(value, 0, opt)
+    rendered = _format(value, 0, opt)
     if not rendered.endswith("\n"):
         rendered += "\n"
     return rendered
@@ -182,13 +179,20 @@ def format_inline(value: Any, options: Optional[FormatOptions] = None) -> str:
 # --------------------------------------------------------------------------
 
 def _format(value: Any, indent_level: int, opt: FormatOptions) -> str:
+    """Block formatter. Iterative: runs as step generators on an explicit
+    stack (weft._trampoline), so any §9-admitted tree depth formats
+    without host recursion."""
+    return _drive(_format_gen(value, indent_level, opt))
+
+
+def _format_gen(value: Any, indent_level: int, opt: FormatOptions):
     # Peel off any Typed wrapper(s) iteratively so a deep type-annotation
     # chain cannot blow the Python recursion limit. Innermost type appears
     # first in the source, outermost last; peeling from outside gives us
     # the chain in reverse order, so we reverse when joining.
     type_chain: list = []
     while isinstance(value, Typed):
-        type_chain.append(_format_type_expr_inline(value.type, opt))
+        type_chain.append((yield _format_type_expr_inline_gen(value.type, opt)))
         value = value.value
     type_suffix = ("::" + "::".join(reversed(type_chain))) if type_chain else ""
 
@@ -209,11 +213,11 @@ def _format(value: Any, indent_level: int, opt: FormatOptions) -> str:
 
     # Multi-line
     if isinstance(value, list):
-        return _format_list_multi(value, indent_level, opt) + type_suffix
+        return (yield _format_list_multi(value, indent_level, opt)) + type_suffix
     if isinstance(value, dict):
-        return _format_map_multi(value, indent_level, opt) + type_suffix
+        return (yield _format_map_multi(value, indent_level, opt)) + type_suffix
     if isinstance(value, Sexpr):
-        return _format_sexpr_multi(value, indent_level, opt) + type_suffix
+        return (yield _format_sexpr_multi(value, indent_level, opt)) + type_suffix
     # Fallback: inline (even if oversized).
     #
     # SPEC §7.2: multi-line strings use the one-line dquote-escape form
@@ -251,18 +255,23 @@ class _MultilineNeeded(Exception):
 
 
 def _format_inline(value: Any, opt: FormatOptions) -> str:
+    """Inline formatter. Iterative via the generator trampoline."""
+    return _drive(_format_inline_gen(value, opt))
+
+
+def _format_inline_gen(value: Any, opt: FormatOptions):
     # Peel off Typed wrappers iteratively (avoid Python recursion on long chains).
     type_chain: list = []
     while isinstance(value, Typed):
-        type_chain.append(_format_type_expr_inline(value.type, opt))
+        type_chain.append((yield _format_type_expr_inline_gen(value.type, opt)))
         value = value.value
     type_suffix = ("::" + "::".join(reversed(type_chain))) if type_chain else ""
 
-    s = _format_inline_core(value, opt)
+    s = yield _format_inline_core_gen(value, opt)
     return s + type_suffix
 
 
-def _format_type_expr_inline(t: Any, opt: FormatOptions) -> str:
+def _format_type_expr_inline_gen(t: Any, opt: FormatOptions):
     """Format a type expression (Symbol or Sexpr) in inline form.
 
     Forces strict (single-line) formatting so an embedded multi-line string
@@ -274,13 +283,13 @@ def _format_type_expr_inline(t: Any, opt: FormatOptions) -> str:
     if isinstance(t, Sexpr):
         parts = [t.tag.name]
         for it in t.items:
-            parts.append(_format_inline(it, strict_opt))
+            parts.append((yield _format_inline_gen(it, strict_opt)))
         return "(" + " ".join(parts) + ")"
     # Shouldn't happen (parser enforces type is Symbol/Sexpr) but be defensive.
-    return _format_inline(t, strict_opt)
+    return (yield _format_inline_gen(t, strict_opt))
 
 
-def _format_inline_core(value: Any, opt: FormatOptions) -> str:
+def _format_inline_core_gen(value: Any, opt: FormatOptions):
     if value is None:
         return "nil"
     if value is True:
@@ -308,7 +317,9 @@ def _format_inline_core(value: Any, opt: FormatOptions) -> str:
     if isinstance(value, Keyword):
         return ":" + value.name
     if isinstance(value, list):
-        parts = [_format_inline(x, opt) for x in value]
+        parts = []
+        for x in value:
+            parts.append((yield _format_inline_gen(x, opt)))
         return "[" + " ".join(parts) + "]"
     if isinstance(value, dict):
         keys = list(value.keys())
@@ -316,12 +327,12 @@ def _format_inline_core(value: Any, opt: FormatOptions) -> str:
             keys = sorted(keys)
         parts = []
         for k in keys:
-            parts.append(":" + _check_map_key(k) + " " + _format_inline(value[k], opt))
+            parts.append(":" + _check_map_key(k) + " " + (yield _format_inline_gen(value[k], opt)))
         return "{" + " ".join(parts) + "}"
     if isinstance(value, Sexpr):
         parts = [value.tag.name]
         for it in value.items:
-            parts.append(_format_inline(it, opt))
+            parts.append((yield _format_inline_gen(it, opt)))
         return "(" + " ".join(parts) + ")"
     raise WeftTypeError(f"cannot format value of type {type(value).__name__}")
 
@@ -509,7 +520,7 @@ def _format_list_multi(items: list, indent_level: int, opt: FormatOptions) -> st
     pad_close = " " * (indent_level * opt.indent)
     lines = []
     for it in items:
-        rendered = _format(it, indent_level + 1, opt)
+        rendered = yield _format_gen(it, indent_level + 1, opt)
         lines.append(pad_inner + rendered)
     return "[\n" + "\n".join(lines) + "\n" + pad_close + "]"
 
@@ -529,7 +540,7 @@ def _format_map_multi(d: dict, indent_level: int, opt: FormatOptions) -> str:
         # Multi-line strings must stay on the same line as the key:
         # re-indenting them would alter their content.
         if isinstance(v, str) and "\n" in v and not opt.strict_canonical:
-            v_block = _format(v, indent_level + 1, opt)
+            v_block = yield _format_gen(v, indent_level + 1, opt)
             lines.append(pad_inner + key_s + " " + v_block)
             continue
         try:
@@ -539,7 +550,7 @@ def _format_map_multi(d: dict, indent_level: int, opt: FormatOptions) -> str:
         if v_inline is not None and len(pad_inner) + len(key_s) + 1 + len(v_inline) <= opt.max_width and "\n" not in v_inline:
             lines.append(pad_inner + key_s + " " + v_inline)
         else:
-            v_block = _format(v, indent_level + 1, opt)
+            v_block = yield _format_gen(v, indent_level + 1, opt)
             if "\n" in v_block:
                 # Put on next line, indented one more
                 deeper_pad = " " * ((indent_level + 2) * opt.indent)
@@ -560,6 +571,6 @@ def _format_sexpr_multi(s: Sexpr, indent_level: int, opt: FormatOptions) -> str:
     pad_close = " " * (indent_level * opt.indent)
     lines = []
     for it in s.items:
-        rendered = _format(it, indent_level + 1, opt)
+        rendered = yield _format_gen(it, indent_level + 1, opt)
         lines.append(pad_inner + rendered)
     return "(" + tag + "\n" + "\n".join(lines) + "\n" + pad_close + ")"

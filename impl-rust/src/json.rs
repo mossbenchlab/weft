@@ -152,9 +152,21 @@ fn from_json_ctx(v: &JVal, strict: bool, depth: usize, ctx: &mut ConvCtx) -> Res
         JVal::Null => Ok(Value::Null),
         JVal::Bool(b) => Ok(Value::Bool(*b)),
         JVal::Number(n) => {
-            if let Some(i) = n.as_i64() { Ok(Value::Int(BigInt::from(i))) }
-            else if let Some(u) = n.as_u64() { Ok(Value::Int(BigInt::from(u))) }
-            else if let Some(f) = n.as_f64() { Ok(Value::Float(f)) }
+            let check_digits = |d: usize, ctx: &ConvCtx| -> Result<()> {
+                if d > ctx.limits.max_int_digits {
+                    return Err(WeftError::limit(
+                        format!("integer has {} digits, exceeds max_int_digits={}", d, ctx.limits.max_int_digits),
+                        "WEFT_LIMIT_INT"));
+                }
+                Ok(())
+            };
+            if let Some(i) = n.as_i64() {
+                check_digits(i.unsigned_abs().to_string().len(), ctx)?;
+                Ok(Value::Int(BigInt::from(i)))
+            } else if let Some(u) = n.as_u64() {
+                check_digits(u.to_string().len(), ctx)?;
+                Ok(Value::Int(BigInt::from(u)))
+            } else if let Some(f) = n.as_f64() { Ok(Value::Float(f)) }
             else { Err(WeftError::type_err("unrepresentable JSON number", "WEFT_TYPE_NUMBER")) }
         }
         JVal::String(s) => {
@@ -311,6 +323,14 @@ pub fn from_json_lossless_with_limits(v: &JVal, limits: Limits) -> Result<Value>
 
 fn from_json_lossless_ctx(v: &JVal, depth: usize, ctx: &mut ConvCtx) -> Result<Value> {
     ctx.bump()?;
+    from_json_lossless_inner(v, depth, ctx)
+}
+
+/// Body of `from_json_lossless_ctx` WITHOUT the total-items bump — used
+/// by the lexical reader's scalar-tag bridge, which has already counted
+/// this value once. One Weft value is one bump, however many
+/// representation layers it passes through.
+fn from_json_lossless_inner(v: &JVal, depth: usize, ctx: &mut ConvCtx) -> Result<Value> {
     match v {
         JVal::Null => Ok(Value::Null),
         JVal::Bool(b) => Ok(Value::Bool(*b)),
@@ -324,6 +344,12 @@ fn from_json_lossless_ctx(v: &JVal, depth: usize, ctx: &mut ConvCtx) -> Result<V
             // narrower JSON safe-integer bound.
             if let Some(i) = n.as_i64() {
                 if (JSON_SAFE_INT_MIN..=JSON_SAFE_INT_MAX).contains(&i) {
+                    let n_digits = i.unsigned_abs().to_string().len();
+                    if n_digits > ctx.limits.max_int_digits {
+                        return Err(WeftError::limit(
+                            format!("integer has {} digits, exceeds max_int_digits={}", n_digits, ctx.limits.max_int_digits),
+                            "WEFT_LIMIT_INT"));
+                    }
                     Ok(Value::Int(BigInt::from(i)))
                 } else {
                     Err(WeftError::type_err(
@@ -1088,7 +1114,8 @@ fn from_lex_lossless(node: &JsonLex, depth: usize, ctx: &mut ConvCtx) -> Result<
                     // the serde-based handlers; their payloads are small by
                     // construction, so bridging to JVal is safe.
                     let j = lex_to_jval(node)?;
-                    from_json_lossless_ctx(&j, depth, ctx)
+                    // from_lex_lossless already bumped for this value.
+                    from_json_lossless_inner(&j, depth, ctx)
                 }
             }
         }

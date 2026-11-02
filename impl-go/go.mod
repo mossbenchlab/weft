@@ -1,3 +1,3 @@
-module github.com/homeaibase-design/weft/impl-go
+module github.com/mossbenchlab/weft/impl-go
 
 go 1.22

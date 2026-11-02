@@ -2,7 +2,7 @@
 
 **Status**: Stable (v1.0, spec revision 1.0.1)
 **Last updated**: 2026-11-02
-**Authors**: homeaibase-design and Claude
+**Authors**: mossbenchlab and Claude
 
 Weft is a textual data format designed for generative AI to read and write.
 It replaces the role that JSON plays today in configuration, interchange, and
@@ -1557,7 +1557,11 @@ For any Weft value `v`:
 parse(format(from_json_lossless(to_json_lossless(v)))) == v
 ```
 
-where `==` is Weft equality (§5.4). Furthermore, after canonical
+where `==` is Weft equality (§5.4) — with the same NaN carve-out as
+§7.1's fidelity invariant: §5.16 defines `nan ≢ nan`, so for values
+containing float NaN this identity is instead **canonical byte
+identity** of the two sides; the `==` form holds for every NaN-free
+value. Furthermore, after canonical
 formatting (§7):
 
 ```

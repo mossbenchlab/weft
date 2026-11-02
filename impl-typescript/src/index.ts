@@ -2121,24 +2121,14 @@ class JsonReader {
       if (cc < 0x20) throw this.err("unescaped control character in JSON string");
       out += c;
       this.i++;
-      if (out.length > this.strCap()) {
-        // Structural bound only — a JSON string here may be a tag name, a
-        // map key, a $bigint/$dec digit payload (bounded by
-        // max_int_digits) or a $str payload (bounded by
-        // max_string_bytes). The exact §9 limit for each role is enforced
-        // during conversion; this cap just stops unbounded reading.
-        throw new WeftLimitError(`JSON string exceeds structural bound (max_string_bytes=${this.limits.max_string_bytes})`,
-          {code: "WEFT_LIMIT_STRING"});
-      }
     }
+    // No length cap here: the whole input already passed max_size_bytes,
+    // so a raw JSON string cannot exceed the input size — and a string
+    // may legitimately be an identifier (Symbol/Keyword/map key), which
+    // Weft's own text parser does not bound by max_string_bytes. The
+    // role-specific §9 limits ($str payloads, digit payloads) are
+    // enforced during conversion.
     return out;
-  }
-
-  /** Structural cap for raw JSON strings — comfortably above every
-   *  legitimate role a string can play in the §11.2 encoding. */
-  private strCap(): number {
-    return Math.max(2 * this.limits.max_string_bytes,
-                    this.limits.max_int_digits + 16, 64) + 16;
   }
 
   private number(): JsonNum {
@@ -2294,7 +2284,7 @@ export function fromJsonLossless(value: unknown, limits: Limits = DEFAULT_LIMITS
       return v;
     }
     if (typeof node === "bigint") {
-      if (node >= SAFE_INT_MIN && node <= SAFE_INT_MAX) return node;
+      if (node >= SAFE_INT_MIN && node <= SAFE_INT_MAX) { checkIntDigits(node, limits); return node; }
       throw new WeftTypeError('bigint outside JSON-safe range must use the {"$int-big": ...} tagged form');
     }
     if (typeof node === "string") {

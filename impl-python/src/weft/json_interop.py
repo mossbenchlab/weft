@@ -9,7 +9,8 @@ import re
 from typing import Any
 
 from .errors import WeftLimitError, WeftSyntaxError, WeftTypeError
-from .parser import _recursion_headroom as _rec_headroom
+from ._trampoline import drive as _drive
+from .jsonio import dump_json as _dump_json, parse_json as _parse_json
 import re as _re
 _HEX_RE = _re.compile(r"[0-9a-fA-F]*")
 from .types import (
@@ -123,14 +124,13 @@ def _datetime_canonical(d: _dt.datetime) -> str:
 
 
 def to_json(value: Any) -> Any:
-    """Lossy SPEC §11.3 mapping (rules in _to_json_rec). Wrapped in the
-    recursion-headroom guard so any tree the §9 limits admit (hard
-    max_depth 1024) converts without a host RecursionError."""
-    with _rec_headroom(1024):
-        return _to_json_rec(value)
+    """Lossy SPEC §11.3 mapping (rules in _to_json_gen). Iterative via
+    the generator trampoline — any tree the §9 limits admit converts
+    without host recursion."""
+    return _drive(_to_json_gen(value))
 
 
-def _to_json_rec(value: Any) -> Any:
+def _to_json_gen(value: Any):
     """Convert a Weft tree to a JSON-serializable Python value (LOSSY).
 
     This is the "friendly" mapping. Symbols and Keywords both become plain
@@ -174,13 +174,23 @@ def _to_json_rec(value: Any) -> Any:
     if isinstance(value, Keyword):
         return "#kw:" + value.name
     if isinstance(value, list):
-        return [_to_json_rec(x) for x in value]
+        out = []
+        for x in value:
+            out.append((yield _to_json_gen(x)))
+        return out
     if isinstance(value, dict):
-        return {k: _to_json_rec(v) for k, v in value.items()}
+        out_d = {}
+        for k, v in value.items():
+            out_d[k] = yield _to_json_gen(v)
+        return out_d
     if isinstance(value, Sexpr):
-        return {"$sexpr": [value.tag.name] + [_to_json_rec(x) for x in value.items]}
+        arr = [value.tag.name]
+        for x in value.items:
+            arr.append((yield _to_json_gen(x)))
+        return {"$sexpr": arr}
     if isinstance(value, Typed):
-        return {"$typed": {"v": _to_json_rec(value.value), "t": _to_json_rec(value.type)}}
+        return {"$typed": {"v": (yield _to_json_gen(value.value)),
+                           "t": (yield _to_json_gen(value.type))}}
     raise WeftTypeError(f"cannot convert {type(value).__name__} to JSON")
 
 
@@ -327,13 +337,12 @@ def from_json(value: Any, *, strict: bool = True,
 
 
 def to_json_lossless(value: Any) -> Any:
-    """Lossless SPEC §11.2 mapping (tag table in _to_json_lossless_rec).
-    Wrapped in the recursion-headroom guard — see to_json."""
-    with _rec_headroom(1024):
-        return _to_json_lossless_rec(value)
+    """Lossless SPEC §11.2 mapping (tag table in _to_json_lossless_gen).
+    Iterative via the generator trampoline — see to_json."""
+    return _drive(_to_json_lossless_gen(value))
 
 
-def _to_json_lossless_rec(value: Any) -> Any:
+def _to_json_lossless_gen(value: Any):
     """Lossless JSON mapping. Every Weft type becomes a tagged JSON object
     (except for plain-JSON types: null, bool, native-safe int, number).
 
@@ -357,7 +366,7 @@ def _to_json_lossless_rec(value: Any) -> Any:
                                          case under $sexpr etc.)
       {"$map": {"k": v, ...}}           Map
 
-    Round-trip property: ``from_json_lossless(_to_json_lossless_rec(x)) == x``
+    Round-trip property: ``from_json_lossless(to_json_lossless(x)) == x``
     for every valid Weft tree.
     """
     if value is None: return None
@@ -404,14 +413,23 @@ def _to_json_lossless_rec(value: Any) -> Any:
     if isinstance(value, Keyword):
         return {"$kw": value.name}
     if isinstance(value, list):
-        return {"$list": [_to_json_lossless_rec(x) for x in value]}
+        arr = []
+        for x in value:
+            arr.append((yield _to_json_lossless_gen(x)))
+        return {"$list": arr}
     if isinstance(value, dict):
-        return {"$map": {k: _to_json_lossless_rec(v) for k, v in value.items()}}
+        payload = {}
+        for k, v in value.items():
+            payload[k] = yield _to_json_lossless_gen(v)
+        return {"$map": payload}
     if isinstance(value, Sexpr):
-        return {"$sexpr": [value.tag.name] + [_to_json_lossless_rec(x) for x in value.items]}
+        arr = [value.tag.name]
+        for x in value.items:
+            arr.append((yield _to_json_lossless_gen(x)))
+        return {"$sexpr": arr}
     if isinstance(value, Typed):
-        return {"$typed": {"v": _to_json_lossless_rec(value.value),
-                            "t": _to_json_lossless_rec(value.type)}}
+        return {"$typed": {"v": (yield _to_json_lossless_gen(value.value)),
+                           "t": (yield _to_json_lossless_gen(value.type))}}
     raise WeftTypeError(f"cannot losslessly convert {type(value).__name__}")
 
 
@@ -681,7 +699,9 @@ def dumps_json(value: Any, *, lossless: bool = True,
     not generally round-trippable).
     """
     j = to_json_lossless(value) if lossless else to_json(value)
-    return json.dumps(j, indent=indent, ensure_ascii=False, sort_keys=False)
+    # Iterative writer — stdlib json.dumps recurses with host-dependent
+    # depth tolerance; any §9-admitted tree must serialize everywhere.
+    return _dump_json(j, indent=indent)
 
 
 def loads_json(text: str, *, lossless: bool = True,
@@ -705,7 +725,7 @@ def loads_json(text: str, *, lossless: bool = True,
       (WEFT_LIMIT_INT).
     """
     from .limits import DEFAULT_LIMITS
-    from .validators import dec_str_to_int, json_max_nesting
+    from .validators import dec_str_to_int  # noqa: F401 (kept for callers)
     lim = limits or DEFAULT_LIMITS
 
     # A host str may contain lone surrogates (e.g. from a
@@ -722,51 +742,12 @@ def loads_json(text: str, *, lossless: bool = True,
         raise WeftLimitError(
             f"JSON input {size} bytes exceeds max_size_bytes={lim.max_size_bytes}",
             code="WEFT_LIMIT_SIZE")
-    # The lossless encoding wraps every collection in a tag object
-    # ({"$list": [...]}), so a Weft tree of depth D produces up to ~2*D
-    # JSON nesting levels. Allow 2*max_depth + slack here; the precise
-    # Weft-level depth check happens during conversion (_check_depth).
-    nesting = json_max_nesting(text)
-    if nesting > lim.max_depth * 2 + 8:
-        raise WeftLimitError(
-            f"JSON nesting depth {nesting} exceeds limit "
-            f"{lim.max_depth * 2 + 8} (max_depth={lim.max_depth})",
-            code="WEFT_LIMIT_DEPTH")
-
-    def _pairs(pairs):
-        d: dict = {}
-        for k, v in pairs:
-            if k in d:
-                raise WeftSyntaxError(
-                    f"duplicate key {k!r} in JSON object",
-                    code="WEFT_SYNTAX_JSON_DUPKEY")
-            d[k] = v
-        return d
-
-    def _int(tok: str) -> int:
-        n_digits = len(tok) - (1 if tok[0] == "-" else 0)
-        if n_digits > lim.max_int_digits:
-            raise WeftLimitError(
-                f"JSON integer has {n_digits} digits, exceeds "
-                f"max_int_digits={lim.max_int_digits}", code="WEFT_LIMIT_INT")
-        return dec_str_to_int(tok)
-
-    def _const(name: str):
-        raise WeftSyntaxError(
-            f"non-standard JSON extension {name!r} is not accepted "
-            "(SPEC §11.3)", code="WEFT_SYNTAX_JSON")
-
-    try:
-        # The C scanner in ``json`` obeys the interpreter recursion
-        # limit; a max-depth Weft doc produces ~2x JSON nesting, which
-        # must parse once the pre-scan admitted it.
-        with _rec_headroom(lim.max_depth * 2 + 8):
-            j = json.loads(text, object_pairs_hook=_pairs,
-                           parse_int=_int, parse_constant=_const)
-    except (WeftLimitError, WeftSyntaxError):
-        raise
-    except json.JSONDecodeError as e:
-        raise WeftSyntaxError(f"invalid JSON: {e}", code="WEFT_SYNTAX_JSON") from e
+    # Token-level iterative reader (weft.jsonio): duplicate-key
+    # rejection, lexical int/float distinction, digit limits, lone
+    # surrogate rejection, and structural depth/element caps are all
+    # applied WHILE reading — no host recursion, no process-global
+    # recursion-limit changes (SPEC §9 incremental enforcement).
+    j = _parse_json(text, lim)
     if lossless:
         return from_json_lossless(j, limits=lim)
     return from_json(j, limits=lim)

@@ -2342,6 +2342,14 @@ func FromJSONLosslessWithLimits(j any, limits Limits) (Value, error) {
 
 func fromJSONLosslessLimited(j any, depth int, ctx *convCtx) (Value, error) {
 	if err := ctx.bump(); err != nil { return nil, err }
+	return fromJSONLosslessInner(j, depth, ctx)
+}
+
+// fromJSONLosslessInner is the body of fromJSONLosslessLimited WITHOUT
+// the total-items bump — used when re-dispatching a different
+// representation of the SAME value (the *MapOrdered tag wrapper), which
+// has already been counted once. One Weft value is one bump.
+func fromJSONLosslessInner(j any, depth int, ctx *convCtx) (Value, error) {
 	switch val := j.(type) {
 	case nil:
 		return nil, nil
@@ -2421,8 +2429,9 @@ func fromJSONLosslessLimited(j any, depth int, ctx *convCtx) (Value, error) {
 				"WEFT_TYPE_LOSSLESS")
 		}
 		// Re-dispatch the single tagged entry; depth is unchanged (the
-		// wrapper object itself is not a Weft structural level).
-		return fromJSONLosslessLimited(map[string]any{val.Keys[0]: val.Items[val.Keys[0]]}, depth, ctx)
+		// wrapper object itself is not a Weft structural level) and the
+		// value was already counted by the bump at the entry point.
+		return fromJSONLosslessInner(map[string]any{val.Keys[0]: val.Items[val.Keys[0]]}, depth, ctx)
 	case map[string]any:
 		if len(val) != 1 {
 			return nil, newErr(ErrType,

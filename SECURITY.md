@@ -34,12 +34,18 @@ The guarantees the reference implementations make (SPEC §9, §10):
 * **Bounded resources.** All limits (`max_depth`, `max_size_bytes`,
   `max_int_digits`, `max_items_per_coll`, `max_string_bytes`,
   `max_total_items`) are enforced on *every* tree-building entry point —
-  the Weft parser **and** the lossless/lossy JSON readers — and
-  oversized input is rejected early, before unbounded work happens.
+  the Weft parser, the JSON **text** readers (token-level, applied
+  while reading) and the decoded-object entry points (`from_json*`) —
+  and oversized input is rejected early. Per SPEC §9, JSON-interop
+  structural caps at the representation level may be `2x + slack`, with
+  the exact Weft limits enforced against converted values.
 * **No stack overflow.** Parsing, formatting, equality, and JSON
-  conversion are iterative or depth-capped in all four implementations;
-  deep input yields `WEFT_LIMIT_DEPTH`, never a crash (in Go, never a
-  goroutine stack abort).
+  conversion (text readers and writers included) are iterative or
+  depth-capped in all four implementations; deep input yields
+  `WEFT_LIMIT_DEPTH`, never a crash (in Go, never a goroutine stack
+  abort). The Python implementation never touches
+  `sys.setrecursionlimit` — concurrent parses of different depths are
+  safe, and no process-global interpreter state is modified.
 * **No host-integer traps.** Huge integer literals are length-checked
   before conversion; the Python implementation converts in chunks and is
   immune to `int_max_str_digits`.
@@ -54,8 +60,15 @@ The guarantees the reference implementations make (SPEC §9, §10):
   conformance corpus and differential fuzzing in CI), so signatures over
   canonical bytes cannot be desynchronized by implementation choice.
 
-Anything that violates one of these guarantees on arbitrary input is a
-security bug — please report it.
+* **Hostile schema patterns.** `:pattern` constraints are matched by a
+  linear-time Thompson-NFA engine (no backtracking, no timeouts) with
+  compile-time resource limits; invalid, unsupported or oversized
+  patterns are schema diagnostics, never host exceptions. See
+  `spec/SCHEMA-PATTERN.md` for the normative subset and limits.
+
+Anything that violates one of these guarantees on arbitrary input —
+including a hostile *pattern*, concurrent API use, or limit-boundary
+input — is a security bug — please report it.
 
 ## Out of scope
 

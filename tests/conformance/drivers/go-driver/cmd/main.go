@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	weft "github.com/homeaibase-design/weft/impl-go"
+	weft "github.com/mossbenchlab/weft/impl-go"
 )
 
 func stable(x any) string {

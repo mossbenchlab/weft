@@ -146,7 +146,8 @@
  {
   "id": "v2-json-lone-surrogate",
   "spec": "§5.7/§11.2",
-  "json": "{\"$str\":\"\\ud800\"}"
+  "json": "{\"$str\":\"\\ud800\"}",
+  "code": "WEFT_SYNTAX_JSON"
  },
  {
   "id": "v2-json-nan-token",
@@ -188,6 +189,7 @@
  {
   "id": "v3-json-rev-surrogates",
   "spec": "§5.7",
-  "json": "{\"$str\": \"\\udc00\\ud800\"}"
+  "json": "{\"$str\": \"\\udc00\\ud800\"}",
+  "code": "WEFT_SYNTAX_JSON"
  }
 ]

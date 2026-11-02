@@ -51,8 +51,11 @@ except Exception as e:  # pragma: no cover
 
 # --- 2. required files present -------------------------------------------
 REQUIRED = [
-    "spec/SPEC.md", "CHANGELOG.md", "README.md", "SECURITY.md", "LICENSE",
+    "spec/SPEC.md", "spec/SCHEMA-PATTERN.md", "CHANGELOG.md", "README.md",
+    "SECURITY.md", "LICENSE",
     "impl-python/src/weft/__init__.py", "impl-python/src/weft/validators.py",
+    "impl-python/src/weft/repat.py", "impl-python/src/weft/jsonio.py",
+    "impl-python/src/weft/_trampoline.py",
     "impl-python/tests/selftest.py",
     "impl-typescript/src/index.ts", "impl-typescript/package.json",
     "impl-typescript/tsconfig.json", "impl-typescript/tests/selftest.js",
