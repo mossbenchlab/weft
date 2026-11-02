@@ -380,6 +380,11 @@ function posFromOffset(text: string, offset: number): [number, number] {
   return [line, col];
 }
 
+function isDelOrC1(ch: string): boolean {
+  const cc = ch.charCodeAt(0);
+  return cc === 0x7f || (cc >= 0x80 && cc <= 0x9f);
+}
+
 class Lexer {
   text: string;
   pos = 0;
@@ -665,6 +670,8 @@ class Lexer {
     throw this.err("unterminated string literal", "WEFT_SYNTAX_STR_UNTERMINATED");
   }
 
+  // SPEC §5.7: literal DEL (U+007F) and C1 (U+0080-U+009F) are forbidden
+  // inside raw and triple-quoted strings (C0 except TAB/LF/CR already is).
   private readTripleString(): string {
     this.advance(3);
     const out: string[] = [];
@@ -676,7 +683,7 @@ class Lexer {
         this.checkStringLimit(s);
         return s;
       }
-      if (FORBIDDEN_CTRL.has(ch)) {
+      if (FORBIDDEN_CTRL.has(ch) || isDelOrC1(ch)) {
         throw this.err(`control character U+${ch.charCodeAt(0).toString(16).toUpperCase()} not permitted in string`,
           "WEFT_SYNTAX_STR_CTRL");
       }
@@ -698,7 +705,7 @@ class Lexer {
         this.checkStringLimit(s);
         return s;
       }
-      if (FORBIDDEN_CTRL.has(ch)) {
+      if (FORBIDDEN_CTRL.has(ch) || isDelOrC1(ch)) {
         throw this.err(`control character U+${ch.charCodeAt(0).toString(16).toUpperCase()} not permitted in raw string`,
           "WEFT_SYNTAX_STR_CTRL");
       }
@@ -1922,12 +1929,11 @@ const DT_PAYLOAD_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-
 const FLOAT_DEC_RE = /^[+-]?(?:[0-9]+\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 function floatCanonicalText(f: number): string {
-  // Preserve the sign of zero so ``-0.0`` round-trips.
-  if (f === 0) return Object.is(f, -0) ? "-0.0" : "0.0";
-  let s = String(f);
-  // Ensure a trailing ``.0`` on whole numbers so re-parse yields a Float.
-  if (!s.includes(".") && !s.includes("e") && !s.includes("E")) s += ".0";
-  return s;
+  // SPEC §11.2.1 rule 4: the $float payload is the §7.3 strict canonical
+  // text. Delegate to the strict formatter so JSON payloads and canonical
+  // documents can never drift apart (``1e-7`` → ``"1e-07"``, ``1e20`` →
+  // ``"1e+20"``), matching the other implementations byte for byte.
+  return formatNumber(f);
 }
 
 const LOSSLESS_TAGS = new Set([
@@ -2031,8 +2037,13 @@ class JsonReader {
       const v = this.value(depth + 1);
       Object.defineProperty(out, k, {value: v, enumerable: true, writable: true, configurable: true});
       count++;
-      if (count > this.limits.max_items_per_coll) {
-        throw new WeftLimitError(`JSON object exceeds max_items_per_coll=${this.limits.max_items_per_coll}`,
+      // Structural bound only: a lossless tag object wraps the Weft value,
+      // so a conforming encoding may hold up to one extra member/element
+      // beyond the Weft item count ({"$sexpr": [tag, ...items]}, the
+      // two-key $typed/$bin payload objects). The exact §9 Weft limit is
+      // enforced during conversion against the *Weft* item count.
+      if (count > this.limits.max_items_per_coll * 2 + 8) {
+        throw new WeftLimitError(`JSON object exceeds structural bound (max_items_per_coll=${this.limits.max_items_per_coll})`,
           {code: "WEFT_LIMIT_ITEMS"});
       }
       this.ws();
@@ -2049,8 +2060,9 @@ class JsonReader {
     if (this.s[this.i] === "]") { this.i++; return out; }
     while (true) {
       out.push(this.value(depth + 1));
-      if (out.length > this.limits.max_items_per_coll) {
-        throw new WeftLimitError(`JSON array exceeds max_items_per_coll=${this.limits.max_items_per_coll}`,
+      // Structural bound — see object(); a $sexpr array holds items+1.
+      if (out.length > this.limits.max_items_per_coll * 2 + 8) {
+        throw new WeftLimitError(`JSON array exceeds structural bound (max_items_per_coll=${this.limits.max_items_per_coll})`,
           {code: "WEFT_LIMIT_ITEMS"});
       }
       this.ws();
@@ -2109,18 +2121,24 @@ class JsonReader {
       if (cc < 0x20) throw this.err("unescaped control character in JSON string");
       out += c;
       this.i++;
-      if (out.length > this.limits.max_string_bytes) {
-        // UTF-16 length is a lower bound on the UTF-8 byte count, so this
-        // incremental check can only under-trigger; the exact check follows.
-        throw new WeftLimitError(`JSON string exceeds max_string_bytes=${this.limits.max_string_bytes}`,
+      if (out.length > this.strCap()) {
+        // Structural bound only — a JSON string here may be a tag name, a
+        // map key, a $bigint/$dec digit payload (bounded by
+        // max_int_digits) or a $str payload (bounded by
+        // max_string_bytes). The exact §9 limit for each role is enforced
+        // during conversion; this cap just stops unbounded reading.
+        throw new WeftLimitError(`JSON string exceeds structural bound (max_string_bytes=${this.limits.max_string_bytes})`,
           {code: "WEFT_LIMIT_STRING"});
       }
     }
-    if (utf8Len(out) > this.limits.max_string_bytes) {
-      throw new WeftLimitError(`JSON string exceeds max_string_bytes=${this.limits.max_string_bytes}`,
-        {code: "WEFT_LIMIT_STRING"});
-    }
     return out;
+  }
+
+  /** Structural cap for raw JSON strings — comfortably above every
+   *  legitimate role a string can play in the §11.2 encoding. */
+  private strCap(): number {
+    return Math.max(2 * this.limits.max_string_bytes,
+                    this.limits.max_int_digits + 16, 64) + 16;
   }
 
   private number(): JsonNum {
@@ -2208,6 +2226,21 @@ function checkDepth(depth: number, limits: Limits): void {
   }
 }
 
+function checkIntDigits(v: bigint, limits: Limits): void {
+  const digits = (v < 0n ? -v : v).toString().length;
+  if (digits > limits.max_int_digits) {
+    throw new WeftLimitError(`integer has ${digits} digits, exceeds max_int_digits=${limits.max_int_digits}`,
+      {code: "WEFT_LIMIT_INT"});
+  }
+}
+
+function checkStrBytes(s: string, limits: Limits): void {
+  if (utf8Len(s) > limits.max_string_bytes) {
+    throw new WeftLimitError(`string exceeds max_string_bytes=${limits.max_string_bytes}`,
+      {code: "WEFT_LIMIT_STRING"});
+  }
+}
+
 function checkColl(n: number, limits: Limits): void {
   if (n > limits.max_items_per_coll) {
     throw new WeftLimitError(`collection has ${n} items, exceeds max_items_per_coll=${limits.max_items_per_coll}`,
@@ -2242,6 +2275,7 @@ export function fromJsonLossless(value: unknown, limits: Limits = DEFAULT_LIMITS
       if (v < SAFE_INT_MIN || v > SAFE_INT_MAX) {
         throw new WeftTypeError('integer outside JSON-safe range must use the {"$int-big": ...} tagged form');
       }
+      checkIntDigits(v, limits);
       return v;
     }
     if (typeof node === "number") {
@@ -2255,7 +2289,9 @@ export function fromJsonLossless(value: unknown, limits: Limits = DEFAULT_LIMITS
       if (node < Number(SAFE_INT_MIN) || node > Number(SAFE_INT_MAX)) {
         throw new WeftTypeError('integer outside JSON-safe range must use the {"$int-big": ...} tagged form');
       }
-      return BigInt(node);
+      const v = BigInt(node);
+      checkIntDigits(v, limits);
+      return v;
     }
     if (typeof node === "bigint") {
       if (node >= SAFE_INT_MIN && node <= SAFE_INT_MAX) return node;
@@ -2432,8 +2468,32 @@ export function fromJsonLossless(value: unknown, limits: Limits = DEFAULT_LIMITS
   return runTrampoline(conv, value);
 }
 
+/** True when the UTF-16 sequence contains an unpaired surrogate half —
+ *  i.e. it is not a valid Unicode scalar sequence (SPEC §5.7). */
+function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = i + 1 < s.length ? s.charCodeAt(i + 1) : -1;
+      if (d < 0xdc00 || d > 0xdfff) return true;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function unwrapStr(payload: unknown, tag: string): string {
   if (typeof payload !== "string") throw new WeftTypeError(`${tag} payload must be a string`);
+  // Every decoded-object entry point must enforce this, not only the
+  // text reader: a host string from JSON.parse (or built by the caller)
+  // can carry lone surrogates, which a Weft String must never hold —
+  // UTF-8 output would silently turn them into U+FFFD.
+  if (hasLoneSurrogate(payload)) {
+    throw new WeftSyntaxError(`${tag} payload contains a lone surrogate (Weft strings are Unicode scalar sequences)`,
+      {code: "WEFT_SYNTAX_JSON"});
+  }
   return payload;
 }
 
@@ -2452,12 +2512,23 @@ export function fromJson(value: unknown, opts: {strict?: boolean; limits?: Limit
     if (node === true || node === false) return node;
     if (node instanceof JsonNum) {
       // SPEC §11.3: lexical distinction — integer token → Integer.
-      if (node.isInteger()) return BigInt(node.raw);
+      if (node.isInteger()) {
+        const v = BigInt(node.raw);
+        checkIntDigits(v, limits);
+        return v;
+      }
       return Number(node.raw);
     }
     if (typeof node === "number") return node;
-    if (typeof node === "bigint") return node;
-    if (typeof node === "string") return node;
+    if (typeof node === "bigint") { checkIntDigits(node, limits); return node; }
+    if (typeof node === "string") {
+      if (hasLoneSurrogate(node)) {
+        throw new WeftSyntaxError("JSON string contains a lone surrogate (Weft strings are Unicode scalar sequences)",
+          {code: "WEFT_SYNTAX_JSON"});
+      }
+      checkStrBytes(node, limits);
+      return node;
+    }
     if (Array.isArray(node)) {
       checkDepth(depth + 1, limits);
       checkColl(node.length, limits);
@@ -2586,8 +2657,17 @@ export function equals(a: WeftValue, b: WeftValue): boolean {
   return true;
 }
 
-export function dumpsJson(value: WeftValue, indent?: number): string {
-  return JSON.stringify(toJson(value), null, indent);
+export function dumpsJson(value: WeftValue,
+                          opts: number | {lossless?: boolean; indent?: number} = {}): string {
+  // Defaults to the LOSSLESS mapping (SPEC §11.2) so that
+  // ``loadsJson(dumpsJson(v))`` round-trips for every value — symmetric
+  // with ``loadsJson``'s default. Pass ``{lossless: false}`` for the
+  // lossy §11.3 mapping. A bare number argument is accepted as
+  // ``indent`` for backward compatibility.
+  const o = typeof opts === "number" ? {indent: opts} : opts;
+  const lossless = o.lossless ?? true;
+  const j = lossless ? toJsonLossless(value) : toJson(value);
+  return JSON.stringify(j, null, o.indent);
 }
 
 /** JSON text → Weft tree. SPEC §11.2: the LOSSLESS mapping is the default

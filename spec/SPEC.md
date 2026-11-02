@@ -221,9 +221,12 @@ the ambiguity with a top-level reserved literal.
 **Token boundary.** After an INT, BIGINT, FLOAT, DECIMAL, DATETIME,
 BINARY, SYMBOL, or KEYWORD token, the next byte (if any) MUST be one
 of: whitespace (per §4.1), `(`, `)`, `[`, `]`, `{`, `}`, `"`, `;`,
-`#` (opening a datetime or a block comment), `::`, or EOF. Any other
-byte following such a token MUST be rejected with a lexical error,
-because the previous token has not ended yet.
+`:` (opening a keyword; after a SYMBOL or KEYWORD a single `:` only
+terminates the token when it begins a well-formed keyword — `foo:bar`
+is `foo` followed by `:bar`), `#` (opening a datetime or a block
+comment), `::`, or EOF. Any other byte following such a token MUST be
+rejected with a lexical error, because the previous token has not
+ended yet.
 
 String and parenthesized tokens (`"..."`, `b"..."`, `(`, `[`, `{`,
 `)`, `]`, `}`, `::`) are self-delimiting and need no following
@@ -477,12 +480,13 @@ Any other escape sequence MUST cause a parse error. The 1.0 parser
 is strict: `\e`, `\a`, `\p`, `\s`, and so on are all errors. This
 differs from JSON's permissive handling.
 
-Control characters U+0000 through U+001F (except as produced by
-escape sequences in STRING and TRIPLE, and the single exception
-for U+000A inside TRIPLE and RAW) MUST NOT appear literally in a
-string. A literal tab or newline inside `"..."` is a parse error.
-Inside `"""..."""` and `r"..."`, literal newlines are permitted;
-literal tabs are permitted inside both.
+Control characters U+0000 through U+001F MUST NOT appear literally
+inside a STRING (`"..."`); there they can only be produced by escape
+sequences. A literal tab or newline inside `"..."` is a parse error.
+Inside TRIPLE and RAW the exceptions are exactly the three listed
+above — U+0009 (TAB), U+000A (LF) and U+000D (CR) may appear
+literally; every other code point below U+0020, plus DEL and the C1
+range, is rejected (same rule as the earlier paragraph).
 
 **Normalization**: strings are sequences of Unicode scalar values.
 A parser MUST NOT normalize them (NFC, NFKC, or otherwise). Two
@@ -904,10 +908,12 @@ unicode-L      = <any Unicode scalar whose General Category is L*
 
 keyword        = ":" kw-name
 kw-name        = kw-start-plain *sym-cont
-               / kw-start-sign kw-cont-nodigit *sym-cont
-kw-start-plain = sym-start minus {"+", "-"}
+               / kw-start-sign [kw-cont-nodigit *sym-cont]
+kw-start-plain = ascii-letter / "_" / "*" / "!" / "?" / "." / "/"
+               / unicode-L        ; sym-start without "+" and "-"
 kw-start-sign  = "+" / "-"
-kw-cont-nodigit= sym-cont minus ascii-digit
+kw-cont-nodigit= ascii-letter / "_" / "*" / "!" / "?" / "." / "/"
+               / "+" / "-" / unicode-L   ; sym-cont without ascii-digit
 
 list           = "[" *WS *(value *WS) "]"
 map            = "{" *WS *(keyword *WS value *WS) "}"
@@ -954,7 +960,14 @@ Every canonical output (both modes) MUST satisfy:
 1. **Idempotence**: `format(parse(format(x))) == format(parse(x))`
    bytewise.
 2. **Fidelity**: for every value category in §5, formatting followed
-   by parsing yields a value equal (`≡`, §5.16) to the input.
+   by parsing yields a value equal (`≡`, §5.16) to the input — with
+   one carve-out: §5.16 defines `nan ≢ nan`, so for values containing
+   float NaN the fidelity requirement is instead **canonical byte
+   identity**: `format(parse(format(x)))` equals `format(x)` bytewise
+   and the re-parsed value differs from the input at most in NaN
+   positions (same NaN bit-sign and payload class is NOT required).
+   Round-trip test suites MUST therefore compare canonical bytes, not
+   `≡`, for NaN-bearing documents.
 3. **No lossy coercion**: an Integer remains an Integer; a BigInt
    remains a BigInt; a Decimal remains a Decimal; Symbol vs Keyword
    vs String are preserved; `-0.0` remains `-0.0` (sign of zero,
@@ -962,6 +975,19 @@ Every canonical output (both modes) MUST satisfy:
 4. **Line separator** is `\n`. No trailing whitespace on any line.
    Document ends with exactly one `\n`.
 5. **UTF-8** throughout; no BOM.
+
+Two distinct guarantees follow, and they MUST NOT be conflated:
+
+- **Byte determinism** — every conforming implementation turns the
+  same input document into the same strict-canonical bytes. This is
+  what makes canonical bytes safe to hash and sign.
+- **Equality** (`≡`, §5.16) is a *value* relation and deliberately
+  coarser than byte identity: `0 ≡ 0n` holds while their strict
+  bytes differ (`0` vs `0n` — the host-type hint is preserved).
+  Equal values are therefore NOT guaranteed to hash identically.
+  Protocols that need "equal implies same hash" MUST normalise the
+  value representation first (e.g. convert BigInt-hinted integers
+  to plain Integers) before taking canonical bytes.
 
 ### 7.2. Canonical (default)
 
@@ -1033,9 +1059,11 @@ conforming implementations for a given abstract value.
 **Keys sort order.**
 
 - Maps are emitted with keys in **ascending Unicode code-point
-  order** of the keyword name. This is a code-point comparison, not
-  UTF-16 nor UTF-8 lexicographic (which happen to agree on BMP but
-  differ on supplementary planes).
+  order** of the keyword name. For well-formed Unicode scalar
+  sequences this is identical to byte-wise comparison of the UTF-8
+  encodings; it is NOT UTF-16 code-unit order, which disagrees on
+  supplementary-plane characters (a UTF-16 host comparing raw code
+  units would sort U+1D400 before U+E000, which is wrong here).
 
 **Strings — escapes.**
 
@@ -1075,8 +1103,9 @@ conforming implementations for a given abstract value.
 - Choice between fixed-point and exponent:
   - If `|f|` lies in `[1e-4, 1e16)`, emit fixed-point form with
     at least one digit on each side of the `.` (e.g. `1.0`,
-    `0.0001`, `12345678901234.0`, `9.999999999999999e15`
-    for 1e16 exactly, etc.).
+    `0.0001`, `12345678901234.0`, `9999999999999998.0` for the
+    largest double below 1e16). `1e16` itself is outside the
+    window and emits as `1e+16`.
   - Otherwise emit exponent form `D.DDDe±NN`: lowercase `e`,
     explicit sign, exponent magnitude zero-padded to at least two
     digits (`1e-07`, `1e+20`, `1e+100`).
@@ -1193,6 +1222,20 @@ Rules:
 - Limits are checked incrementally. A parser MUST NOT allocate a
   buffer sized to the input before validating the input is within
   limits.
+- **JSON interop entry points** (§11) may delegate the token-level
+  decode to a host JSON parser. There, "incremental" means the
+  decode phase is bounded by `max_size_bytes` (which is checked
+  first): a conforming implementation MAY fully decode a
+  size-admitted JSON text before applying the per-collection and
+  per-value limits during conversion, because the decode-phase
+  memory is O(`max_size_bytes`) regardless. Structural caps during
+  the decode phase (reader nesting, raw element counts, raw string
+  length) are bounds on the JSON *representation* and MAY be looser
+  than the Weft-value limits (e.g. `2 x limit + slack`), since one
+  Weft value costs up to two JSON levels and a tag wrapper; the
+  exact Weft limits MUST then be enforced against the *converted
+  Weft values*, so that a legitimate value within limits is never
+  rejected because of its tag overhead.
 - **Depth** is defined by §8. It counts structural levels in the
   value tree (List/Map/Sexpr/Typed add one; scalars add none), not
   the number of open brackets in the source. The root value's
@@ -1462,7 +1505,12 @@ Reserved tag names:
 
 7. **Binary**: `{"$bin": {"enc": "base64", "data": "..."}}` or
    `{"$bin": {"enc": "hex", "data": "..."}}`. The `$bin` payload
-   MUST contain exactly the keys `enc` and `data`.
+   MUST contain exactly the keys `enc` and `data`. Decoders MUST
+   reject non-canonical payloads: for `base64`, data that decodes
+   with non-zero trailing bits; for `hex`, anything other than an
+   even count of `[0-9a-fA-F]` — in particular, whitespace inside
+   the hex data MUST be rejected (hosts whose hex decoder tolerates
+   spaces, like Python's ``bytes.fromhex``, must pre-validate).
 
 8. **DateTime**: `{"$dt": "..."}` with payload being the strict
    canonical form (§7.3, §5.9). All three shapes are preserved
@@ -1704,9 +1752,13 @@ defined against **Unicode 15.0**. An implementation MAY use a newer
 Unicode version for the `L*` lookup; because new Unicode versions
 only add letter assignments to previously-unassigned code points,
 documents restricted to assigned Unicode 15.0 letters parse
-identically everywhere. Producers that need byte-stable identifier
-acceptance across implementations built on different Unicode
-versions SHOULD restrict identifiers to ASCII. A future minor
+identically everywhere. The converse is the interoperability caveat:
+an identifier using a letter assigned *after* 15.0 is accepted by an
+implementation on a newer Unicode table and rejected by one pinned at
+15.0 — acceptance of post-15.0 letters is NOT uniform across
+conforming implementations, by design. Producers that need byte-stable
+identifier acceptance across implementations built on different
+Unicode versions SHOULD restrict identifiers to ASCII. A future minor
 version of this specification may re-pin the Unicode version.
 
 Suggested media type: `application/weft`.

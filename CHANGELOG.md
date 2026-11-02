@@ -104,3 +104,91 @@ verified by the four-implementation differential harness
 - `SECURITY.md` (threat model + private reporting; resolves SPEC §10.9),
   `README.md`, `LICENSE` (MIT).
 - Per-implementation self-tests covering every 1.0.1 regression class.
+
+## 1.0.1-rc2 (external review round 3 fixes)
+
+### P1
+- **schema `:pattern` is now matched by a linear-time Thompson-NFA engine**
+  (`weft.repat`, Python — the only implementation with the schema
+  validator). The previous lint + wall-clock-timeout approach could not
+  stop a backtracking host engine that holds the GIL; the new engine
+  cannot backtrack, needs no timeout, and rejects out-of-subset patterns
+  (backreferences, lookaround, named groups, inline flags) with
+  `WEFT_SCHEMA_PATTERN`. `\d`/`\w`/`\s` are pinned to ASCII sets.
+
+### P2
+- **dumps/loads defaults are symmetric**: `dumps_json` (Python),
+  `dumpsJson` (TypeScript) now default to the lossless §11.2 mapping,
+  matching `loads_json`/`loadsJson`; pass `lossless=False` /
+  `{lossless: false}` for §11.3. Go gains `DumpJSONLossless` as the
+  write-side pair of `LoadsJSONLossless`.
+- **JSON reader limits split into representation vs value layers**
+  (TS reader, Go `decodeAnyOrdered`; Python's pre-scan was already
+  2x-based): tag names, `$sexpr`'s leading tag element, and the 2-key
+  `$typed`/`$bin` payload objects no longer count against
+  `max_items_per_coll`/`max_string_bytes`; the exact §9 limits are
+  enforced against converted Weft values. SPEC §9 now states this rule.
+- **Every value-level entry point enforces §9 limits and Unicode
+  validity**: `from_json`/`from_json_lossless` (Python), `fromJson`/
+  `fromJsonLossless` (TS — including lone-surrogate rejection on host
+  strings), `FromJSON`/`FromJSONLossless` (Go — rejects invalid UTF-8
+  such as WTF-8 surrogate bytes; new `FromJSONWithLimits`), and Rust's
+  `from_json*` (now ctx-threaded; new `from_json_with_limits`,
+  `from_json_lossless_with_limits`). Python's `loads_json` converts a
+  host `UnicodeEncodeError` on lone-surrogate input into
+  `WEFT_SYNTAX_JSON`.
+- **CLI preserves bytes**: file input is read without universal-newline
+  translation (CRLF inside raw/triple strings survives), and canonical
+  output is byte-identical across stdout / `-o` / `--in-place`, always
+  ending in exactly one LF.
+- **Python parser honours raised `max_depth`**: `parse`, the formatter,
+  `to_json(_lossless)` and the stdlib JSON decode now run under a
+  recursion-headroom guard sized to the depth limit; a depth the limits
+  admit parses, formats and round-trips (verified at 1024), and a
+  RecursionError that still escapes surfaces as `WEFT_LIMIT_DEPTH`.
+- **raw/triple strings reject literal DEL and C1** (SPEC §5.7) in all
+  four implementations; dquote strings are unchanged per SCHAR.
+- **TS `$float` payloads use the strict §7.3 formatter** (`1e-07`,
+  `1e+20`) — `floatCanonicalText` now delegates to `formatNumber`.
+- **Go**: `FromJSONLossless(ToJSONLossless(v))` works directly (the
+  ordered-map marshal adapter and raw safe-range `*big.Int` are accepted
+  by the decoder); the lossy loader no longer swallows non-EOF trailing
+  errors (`"1 x"`, `"1 \"unterminated"` are rejected).
+- **hex `$bin` payloads are strict** in Python too (no whitespace —
+  `bytes.fromhex` leniency is pre-validated away); SPEC §11.2 now spells
+  out canonical-payload rejection for both encodings.
+
+### Specification
+- §4.3: `:` added to the token-boundary list (`[foo:bar]` ≡ `[foo :bar]`,
+  matching all implementations).
+- §5.7: the control-character paragraphs are now consistent (TAB/LF/CR
+  are the exact literal exceptions in TRIPLE/RAW).
+- §7.1: NaN carve-out for the fidelity invariant (round-trip identity
+  for NaN-bearing documents is canonical-byte identity, since §5.16
+  defines `nan ≢ nan`); new paragraph separating the byte-determinism
+  guarantee from `≡`-equality (equal values do NOT hash identically —
+  `0` vs `0n`).
+- §7.3: map-key sort note corrected (code-point order equals UTF-8 byte
+  order for scalar sequences; it is UTF-16 order that differs); the
+  fixed-point window example now uses `9999999999999998.0` (`1e16`
+  itself emits `1e+16`).
+- ABNF: `kw-name` spelled out without pseudo-set-subtraction, and the
+  sign-start branch now admits bare `:+` / `:-`.
+- §9: JSON-interop early-reject semantics defined (decode phase bounded
+  by `max_size_bytes`; representation-level structural caps may be
+  `2x + slack` with exact limits at conversion).
+- §14: explicit interoperability caveat for letters assigned after
+  Unicode 15.0.
+
+### Tests / tooling
+- Conformance: `tolossless` payloads are now normalized (compact,
+  key-sorted) and byte-compared across all four implementations for
+  every valid corpus case — this is the check that would have caught the
+  TS `$float` payload bug. 16 new corpus cases (DEL/C1 in raw/triple,
+  CRLF preservation, `foo:bar` boundary, float payload shapes, hex
+  whitespace, trailing JSON tokens, reversed surrogates). Corpus: 231
+  cases, 615 checks per implementation.
+- Self-tests extended with regressions for every fix above; README's
+  example now parses (the binary literal is `b"base64:..."`) and the
+  fuzzer's atom list uses real syntax; `check_package.py` and the
+  runners read files as UTF-8 explicitly (Windows cp932 default).

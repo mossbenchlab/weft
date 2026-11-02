@@ -109,6 +109,11 @@ _C1_AND_DEL = frozenset(chr(c) for c in list(range(0x7F, 0xA0)))
 # SPEC §4.2 + §10.5: C0-except-TAB/LF/CR + DEL + C1 + bidi.
 _COMMENT_FORBIDDEN = _FORBIDDEN_CTRL | _BIDI_CONTROL | _C1_AND_DEL
 
+# Literal control characters forbidden inside raw and triple-quoted
+# strings (SPEC §5.7): C0 except TAB/LF/CR, plus DEL and C1. Bidi
+# controls stay permitted inside strings (strict output escapes them).
+_RAW_TRIPLE_FORBIDDEN = _FORBIDDEN_CTRL | _C1_AND_DEL
+
 
 # --------------------------------------------------------------------------
 # Lexer
@@ -551,7 +556,7 @@ class Lexer:
                 s = "".join(out)
                 self._check_string_limit(s)
                 return s
-            if ch in _FORBIDDEN_CTRL:
+            if ch in _RAW_TRIPLE_FORBIDDEN:
                 raise self._error(
                     f"control character U+{ord(ch):04X} not permitted "
                     "in triple-quoted string",
@@ -586,7 +591,7 @@ class Lexer:
                 s = "".join(out)
                 self._check_string_limit(s)
                 return s
-            if ch in _FORBIDDEN_CTRL:
+            if ch in _RAW_TRIPLE_FORBIDDEN:
                 raise self._error(
                     f"control character U+{ord(ch):04X} not permitted "
                     "in raw string",
@@ -753,13 +758,13 @@ class Lexer:
                     "hex binary literal must have an even number of digits",
                     "WEFT_SYNTAX_BINARY_HEX",
                 )
-            try:
-                data = bytes.fromhex(payload)
-            except ValueError as e:
+            if any(ch not in "0123456789abcdefABCDEF" for ch in payload):
                 raise self._error(
-                    f"invalid hex in binary literal: {e}",
+                    "invalid hex in binary literal (only [0-9a-fA-F], "
+                    "no whitespace)",
                     "WEFT_SYNTAX_BINARY_HEX",
-                ) from None
+                )
+            data = bytes.fromhex(payload)
             return Binary(data=data, encoding="hex")
 
         raise self._error(

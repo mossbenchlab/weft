@@ -104,3 +104,24 @@ def json_max_nesting(text: str) -> int:
         elif ch in "]}":
             depth -= 1
     return max_depth
+
+
+def int_digits_exceed(x: int, max_digits: int) -> bool:
+    """True when ``abs(x)`` has more than ``max_digits`` decimal digits.
+
+    Works on an already-materialized host int without converting it to a
+    decimal string (which CPython's ``int_max_str_digits`` guard may
+    refuse, and which costs O(n^2) for huge values). The bit length gives
+    an exact lower bound on the digit count; only the single borderline
+    case compares against ``10**max_digits`` directly.
+    """
+    if x == 0:
+        return max_digits < 1
+    bl = (-x if x < 0 else x).bit_length()
+    # digits(2^(bl-1)) = floor((bl-1)*log10(2)) + 1  — exact lower bound.
+    digits_min = ((bl - 1) * 30103) // 100000 + 1
+    if digits_min > max_digits:
+        return True
+    if digits_min == max_digits:
+        return (-x if x < 0 else x) >= 10 ** max_digits
+    return False

@@ -95,7 +95,7 @@ check("version strings agree across spec + 4 impls", len(uniq) == 1,
 for f, lo in [("valid.json", 50), ("invalid.json", 20),
               ("json_valid.json", 5), ("json_invalid.json", 10)]:
     p = os.path.join(ROOT, "tests", "conformance", "corpus", f)
-    n = len(json.load(open(p))) if os.path.exists(p) else 0
+    n = len(json.load(open(p, encoding="utf-8"))) if os.path.exists(p) else 0
     check(f"corpus {f} has >= {lo} cases ({n})", n >= lo)
 
 print()

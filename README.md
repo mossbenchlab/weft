@@ -11,7 +11,7 @@ It pairs with the Lattice project.
  :big 9007199254740993n   ; BigInt — no silent precision loss
  :when #2026-11-02T12:00:00+09:00
  :tags [:data :ai]
- :payload %b64{aGVsbG8=}}
+ :payload b"base64:aGVsbG8="}
 ```
 
 ## Why Weft
@@ -56,6 +56,7 @@ resource limits.
 
 **Python**
 ```python
+import json
 import weft
 v = weft.parse('{:a 1 :b [1.5 2n]}')
 print(weft.format_value(v))                       # pretty

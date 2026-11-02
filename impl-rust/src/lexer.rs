@@ -47,6 +47,12 @@ pub struct Lexer<'a> {
     limits: Limits,
 }
 
+/// SPEC §5.7: literal DEL (U+007F) and C1 (U+0080-U+009F) are forbidden
+/// inside raw and triple-quoted strings.
+fn is_del_or_c1(c: char) -> bool {
+    c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c)
+}
+
 impl<'a> Lexer<'a> {
     pub fn new(text: &'a str, limits: Limits) -> Result<Self> {
         if text.contains('\u{FEFF}') {
@@ -341,7 +347,7 @@ impl<'a> Lexer<'a> {
                 self.check_string_limit(&out)?;
                 return Ok(out);
             }
-            if is_forbidden_ctrl(c) {
+            if is_forbidden_ctrl(c) || is_del_or_c1(c) {
                 return Err(self.err(format!("control char U+{:04X} not permitted in string", c as u32), "WEFT_SYNTAX_STR_CTRL"));
             }
             if c == '\\' { out.push(self.read_escape()?); continue; }
@@ -356,7 +362,7 @@ impl<'a> Lexer<'a> {
         let mut out = String::new();
         while let Some(c) = self.peek(0) {
             if c == '"' { self.advance(1); self.check_string_limit(&out)?; return Ok(out); }
-            if is_forbidden_ctrl(c) {
+            if is_forbidden_ctrl(c) || is_del_or_c1(c) {
                 return Err(self.err(format!("control char U+{:04X} not permitted in raw string", c as u32), "WEFT_SYNTAX_STR_CTRL"));
             }
             out.push(c);

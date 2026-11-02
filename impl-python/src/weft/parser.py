@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import Any, Iterator, List, Optional
 
 from .errors import WeftSyntaxError, WeftLimitError
+import sys as _sys
+import contextlib as _contextlib
 from .lexer import (
     Lexer, Token,
     TK_LPAREN, TK_RPAREN, TK_LBRACK, TK_RBRACK, TK_LBRACE, TK_RBRACE,
@@ -430,6 +432,34 @@ def _strip_types(value: Any) -> Any:
     return value
 
 
+# Frames of Python recursion per Weft nesting level in _Parser (measured
+# with margin). parse()/parse_stream() raise the interpreter recursion
+# limit so every depth the §9 ``max_depth`` setting admits can actually
+# be parsed; a RecursionError that still escapes (hostile frame budget,
+# tiny host stack) surfaces as WEFT_LIMIT_DEPTH, never a host crash.
+_FRAMES_PER_LEVEL = 16
+
+
+@_contextlib.contextmanager
+def _recursion_headroom(max_depth: int):
+    needed = max_depth * _FRAMES_PER_LEVEL + 512
+    old = _sys.getrecursionlimit()
+    raised = needed > old
+    if raised:
+        _sys.setrecursionlimit(needed)
+    try:
+        try:
+            yield
+        except RecursionError:
+            raise WeftLimitError(
+                f"nesting depth exceeds what this host can parse "
+                f"(max_depth={max_depth} admitted it, but the interpreter "
+                f"stack did not)", code="WEFT_LIMIT_DEPTH") from None
+    finally:
+        if raised:
+            _sys.setrecursionlimit(old)
+
+
 def parse(
     text: str,
     *,
@@ -460,7 +490,8 @@ def parse(
             "empty document: single-value mode requires exactly one top-level value",
             code="WEFT_SYNTAX_EMPTY",
         )
-    value = p.parse_value()
+    with _recursion_headroom(limits.max_depth):
+        value = p.parse_value()
     leftover = p.peek()
     if leftover is not None:
         raise WeftSyntaxError(
@@ -490,7 +521,8 @@ def parse_stream(
     p = _Parser(toks, limits=limits, source_text=text)
     values: list = []
     while p.peek() is not None:
-        v = p.parse_value()
+        with _recursion_headroom(limits.max_depth):
+            v = p.parse_value()
         _check_tree_depth(v, limits.max_depth)
         if strip_types:
             v = _strip_types(v)

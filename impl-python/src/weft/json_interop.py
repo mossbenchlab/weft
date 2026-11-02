@@ -9,6 +9,9 @@ import re
 from typing import Any
 
 from .errors import WeftLimitError, WeftSyntaxError, WeftTypeError
+from .parser import _recursion_headroom as _rec_headroom
+import re as _re
+_HEX_RE = _re.compile(r"[0-9a-fA-F]*")
 from .types import (
     BigInt, Binary, Decimal, Keyword, Sexpr, Symbol, Typed, WeftDate,
     is_valid_keyword_name,
@@ -120,6 +123,14 @@ def _datetime_canonical(d: _dt.datetime) -> str:
 
 
 def to_json(value: Any) -> Any:
+    """Lossy SPEC §11.3 mapping (rules in _to_json_rec). Wrapped in the
+    recursion-headroom guard so any tree the §9 limits admit (hard
+    max_depth 1024) converts without a host RecursionError."""
+    with _rec_headroom(1024):
+        return _to_json_rec(value)
+
+
+def _to_json_rec(value: Any) -> Any:
     """Convert a Weft tree to a JSON-serializable Python value (LOSSY).
 
     This is the "friendly" mapping. Symbols and Keywords both become plain
@@ -163,13 +174,13 @@ def to_json(value: Any) -> Any:
     if isinstance(value, Keyword):
         return "#kw:" + value.name
     if isinstance(value, list):
-        return [to_json(x) for x in value]
+        return [_to_json_rec(x) for x in value]
     if isinstance(value, dict):
-        return {k: to_json(v) for k, v in value.items()}
+        return {k: _to_json_rec(v) for k, v in value.items()}
     if isinstance(value, Sexpr):
-        return {"$sexpr": [value.tag.name] + [to_json(x) for x in value.items]}
+        return {"$sexpr": [value.tag.name] + [_to_json_rec(x) for x in value.items]}
     if isinstance(value, Typed):
-        return {"$typed": {"v": to_json(value.value), "t": to_json(value.type)}}
+        return {"$typed": {"v": _to_json_rec(value.value), "t": _to_json_rec(value.type)}}
     raise WeftTypeError(f"cannot convert {type(value).__name__} to JSON")
 
 
@@ -216,6 +227,21 @@ def _check_coll(n: int, lim) -> None:
         raise WeftLimitError(
             f"collection has {n} items, exceeds max_items_per_coll="
             f"{lim.max_items_per_coll}", code="WEFT_LIMIT_ITEMS")
+
+
+def _check_int_digits(x: int, lim) -> None:
+    from .validators import int_digits_exceed
+    if int_digits_exceed(x, lim.max_int_digits):
+        raise WeftLimitError(
+            f"integer exceeds max_int_digits={lim.max_int_digits}",
+            code="WEFT_LIMIT_INT")
+
+
+def _check_str_bytes(s: str, lim) -> None:
+    if len(s.encode("utf-8")) > lim.max_string_bytes:
+        raise WeftLimitError(
+            f"string exceeds max_string_bytes={lim.max_string_bytes}",
+            code="WEFT_LIMIT_STRING")
 
 
 def _run_trampoline(conv, root):
@@ -265,11 +291,13 @@ def from_json(value: Any, *, strict: bool = True,
         if node is True or node is False:
             return node
         if isinstance(node, int):
+            _check_int_digits(node, lim)
             return node
         if isinstance(node, float):
             return node
         if isinstance(node, str):
             _reject_surrogates(node, "JSON string")
+            _check_str_bytes(node, lim)
             return node
         if isinstance(node, list):
             _check_depth(depth + 1, lim)
@@ -299,6 +327,13 @@ def from_json(value: Any, *, strict: bool = True,
 
 
 def to_json_lossless(value: Any) -> Any:
+    """Lossless SPEC §11.2 mapping (tag table in _to_json_lossless_rec).
+    Wrapped in the recursion-headroom guard — see to_json."""
+    with _rec_headroom(1024):
+        return _to_json_lossless_rec(value)
+
+
+def _to_json_lossless_rec(value: Any) -> Any:
     """Lossless JSON mapping. Every Weft type becomes a tagged JSON object
     (except for plain-JSON types: null, bool, native-safe int, number).
 
@@ -322,7 +357,7 @@ def to_json_lossless(value: Any) -> Any:
                                          case under $sexpr etc.)
       {"$map": {"k": v, ...}}           Map
 
-    Round-trip property: ``from_json_lossless(to_json_lossless(x)) == x``
+    Round-trip property: ``from_json_lossless(_to_json_lossless_rec(x)) == x``
     for every valid Weft tree.
     """
     if value is None: return None
@@ -369,14 +404,14 @@ def to_json_lossless(value: Any) -> Any:
     if isinstance(value, Keyword):
         return {"$kw": value.name}
     if isinstance(value, list):
-        return {"$list": [to_json_lossless(x) for x in value]}
+        return {"$list": [_to_json_lossless_rec(x) for x in value]}
     if isinstance(value, dict):
-        return {"$map": {k: to_json_lossless(v) for k, v in value.items()}}
+        return {"$map": {k: _to_json_lossless_rec(v) for k, v in value.items()}}
     if isinstance(value, Sexpr):
-        return {"$sexpr": [value.tag.name] + [to_json_lossless(x) for x in value.items]}
+        return {"$sexpr": [value.tag.name] + [_to_json_lossless_rec(x) for x in value.items]}
     if isinstance(value, Typed):
-        return {"$typed": {"v": to_json_lossless(value.value),
-                            "t": to_json_lossless(value.type)}}
+        return {"$typed": {"v": _to_json_lossless_rec(value.value),
+                            "t": _to_json_lossless_rec(value.type)}}
     raise WeftTypeError(f"cannot losslessly convert {type(value).__name__}")
 
 
@@ -414,6 +449,7 @@ def from_json_lossless(value: Any, *, limits: "Limits" = None) -> Any:
             return node
         if isinstance(node, int) and not isinstance(node, bool):
             if _JSON_SAFE_INT_MIN <= node <= _JSON_SAFE_INT_MAX:
+                _check_int_digits(node, lim)
                 return node
             raise WeftTypeError(
                 "int outside JSON-safe range must use the "
@@ -521,10 +557,14 @@ def from_json_lossless(value: Any, *, limits: "Limits" = None) -> Any:
                 raw = base64.b64decode(data, validate=True)
                 return Binary(data=raw, encoding="base64")
             if enc == "hex":
-                try:
-                    raw = bytes.fromhex(data)
-                except ValueError as e:
-                    raise WeftTypeError(f"$bin.data is not valid hex: {e}") from e
+                # Strict hex only — bytes.fromhex tolerates whitespace
+                # ("00 00"), which other implementations reject; the
+                # payload must be interoperable byte for byte.
+                if len(data) % 2 != 0 or not _HEX_RE.fullmatch(data):
+                    raise WeftTypeError(
+                        f"$bin.data is not valid hex (even count of "
+                        f"[0-9a-fA-F] only, no whitespace): {data!r}")
+                raw = bytes.fromhex(data)
                 return Binary(data=raw, encoding="hex")
             raise WeftTypeError(f"$bin.enc must be 'base64' or 'hex', got {enc!r}")
 
@@ -630,9 +670,18 @@ def from_json_lossless(value: Any, *, limits: "Limits" = None) -> Any:
     return _run_trampoline(conv, value)
 
 
-def dumps_json(value: Any, *, indent: int | None = None) -> str:
-    """Convenience: Weft tree → JSON string."""
-    return json.dumps(to_json(value), indent=indent, ensure_ascii=False, sort_keys=False)
+def dumps_json(value: Any, *, lossless: bool = True,
+               indent: int | None = None) -> str:
+    """Convenience: Weft tree → JSON string.
+
+    Defaults to the LOSSLESS mapping (SPEC §11.2) so that
+    ``loads_json(dumps_json(v))`` round-trips for every value — the two
+    convenience functions share the same default mode. Pass
+    ``lossless=False`` for the lossy §11.3 mapping (plain JSON types,
+    not generally round-trippable).
+    """
+    j = to_json_lossless(value) if lossless else to_json(value)
+    return json.dumps(j, indent=indent, ensure_ascii=False, sort_keys=False)
 
 
 def loads_json(text: str, *, lossless: bool = True,
@@ -659,7 +708,16 @@ def loads_json(text: str, *, lossless: bool = True,
     from .validators import dec_str_to_int, json_max_nesting
     lim = limits or DEFAULT_LIMITS
 
-    size = len(text.encode("utf-8"))
+    # A host str may contain lone surrogates (e.g. from a
+    # ``surrogatepass``/``surrogateescape`` decode); that is not a valid
+    # Unicode scalar sequence, so reject it as a Weft error rather than
+    # letting the host's UnicodeEncodeError escape.
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise WeftSyntaxError(
+            "JSON input contains lone surrogate code points",
+            code="WEFT_SYNTAX_JSON") from None
     if size > lim.max_size_bytes:
         raise WeftLimitError(
             f"JSON input {size} bytes exceeds max_size_bytes={lim.max_size_bytes}",
@@ -699,8 +757,12 @@ def loads_json(text: str, *, lossless: bool = True,
             "(SPEC §11.3)", code="WEFT_SYNTAX_JSON")
 
     try:
-        j = json.loads(text, object_pairs_hook=_pairs,
-                       parse_int=_int, parse_constant=_const)
+        # The C scanner in ``json`` obeys the interpreter recursion
+        # limit; a max-depth Weft doc produces ~2x JSON nesting, which
+        # must parse once the pre-scan admitted it.
+        with _rec_headroom(lim.max_depth * 2 + 8):
+            j = json.loads(text, object_pairs_hook=_pairs,
+                           parse_int=_int, parse_constant=_const)
     except (WeftLimitError, WeftSyntaxError):
         raise
     except json.JSONDecodeError as e:

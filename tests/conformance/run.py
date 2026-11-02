@@ -31,7 +31,7 @@ def build_ts(force: bool = False) -> str:
     drv = os.path.join(out, "tests", "conformance", "drivers", "driver.js")
     if force or not os.path.exists(drv):
         globals_d = os.path.join(HERE, "drivers", "globals.d.ts")
-        with open(globals_d, "w") as fp:
+        with open(globals_d, "w", encoding="utf-8") as fp:
             fp.write("declare const Buffer: any;\n"
                      "declare function atob(s: string): string;\n"
                      "declare function btoa(s: string): string;\n"
@@ -108,11 +108,27 @@ def main():
                 failures.append((impl, case_id, mode,
                                  f"error code mismatch: got {out.strip()!r} want 'ERR {code}'"))
 
+    def norm_lossless(out):
+        if not out.startswith("OK\n"):
+            return None
+        try:
+            j = json.loads(out[3:])
+        except ValueError:
+            return None
+        return json.dumps(j, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
     for case in load("valid.json"):
         for impl in cmds:
             check(impl, case["id"], "canon", case["input"], True, case["canonical"])
             check(impl, case["id"], "canon2", case["input"], True, case["canonical"])
             check(impl, case["id"], "jroundtrip", case["input"], True, case["canonical"])
+            if "lossless" in case:
+                out = run_driver(cmds[impl], "tolossless", case["input"])
+                counts[impl] += 1
+                got = norm_lossless(out)
+                if got != case["lossless"]:
+                    failures.append((impl, case["id"], "tolossless",
+                                     f"lossless mismatch: got {got!r} want {case['lossless']!r}"))
 
     for case in load("invalid.json"):
         for impl in cmds:

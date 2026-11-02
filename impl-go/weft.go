@@ -554,6 +554,11 @@ func (l *lexer) readDquoteString() (string, error) {
 	return "", l.err("unterminated string literal", "WEFT_SYNTAX_STR_UNTERMINATED")
 }
 
+// isDelOrC1 reports whether r is DEL (U+007F) or a C1 control
+// (U+0080-U+009F) — forbidden literal inside raw and triple-quoted
+// strings (SPEC §5.7).
+func isDelOrC1(r rune) bool { return r == 0x7F || (r >= 0x80 && r <= 0x9F) }
+
 func (l *lexer) readTripleString() (string, error) {
 	l.advance(3)
 	var sb strings.Builder
@@ -565,7 +570,7 @@ func (l *lexer) readTripleString() (string, error) {
 			if err := l.checkStringLimit(s); err != nil { return "", err }
 			return s, nil
 		}
-		if isForbiddenCtrl(r) { return "", l.err(fmt.Sprintf("control char U+%04X in string", r), "WEFT_SYNTAX_STR_CTRL") }
+		if isForbiddenCtrl(r) || isDelOrC1(r) { return "", l.err(fmt.Sprintf("control char U+%04X in string", r), "WEFT_SYNTAX_STR_CTRL") }
 		if r == '\\' {
 			ch, err := l.readEscape()
 			if err != nil { return "", err }
@@ -584,7 +589,7 @@ func (l *lexer) readRawString() (string, error) {
 	for l.idx < len(l.runes) {
 		r := l.runes[l.idx]
 		if r == '"' { l.advance(1); s := sb.String(); if err := l.checkStringLimit(s); err != nil { return "", err }; return s, nil }
-		if isForbiddenCtrl(r) { return "", l.err(fmt.Sprintf("control char U+%04X in raw string", r), "WEFT_SYNTAX_STR_CTRL") }
+		if isForbiddenCtrl(r) || isDelOrC1(r) { return "", l.err(fmt.Sprintf("control char U+%04X in raw string", r), "WEFT_SYNTAX_STR_CTRL") }
 		sb.WriteRune(r)
 		l.advance(1)
 	}
@@ -1796,6 +1801,13 @@ func DumpJSON(v Value) ([]byte, error) {
 	return json.Marshal(ToJSON(v))
 }
 
+// DumpJSONLossless is the write-side counterpart of LoadsJSONLossless:
+// LoadsJSONLossless(string(DumpJSONLossless(v))) round-trips every value.
+// (DumpJSON writes the lossy §11.3 mapping and pairs with LoadsJSON.)
+func DumpJSONLossless(v Value) ([]byte, error) {
+	return json.Marshal(ToJSONLossless(v))
+}
+
 // FromJSON converts a JSON value (as unmarshaled by encoding/json) to Weft
 // via the LOSSY mapping (SPEC §11.3). Prefer LoadsJSON for wire input: it
 // preserves the lexical int/float distinction (JSON ``1`` → Integer,
@@ -1803,6 +1815,14 @@ func DumpJSON(v Value) ([]byte, error) {
 // a plain ``json.Unmarshal`` tree cannot witness any of those.
 func FromJSON(j any) (Value, error) {
 	return fromJSON(j, true, 0, &convCtx{limits: DefaultLimits()})
+}
+
+// FromJSONWithLimits is FromJSON with explicit SPEC §9 limits — the
+// value-level entry point enforces the same scalar and structural
+// limits as the text loaders.
+func FromJSONWithLimits(j any, limits Limits) (Value, error) {
+	if err := limits.validate(); err != nil { return nil, err }
+	return fromJSON(j, true, 0, &convCtx{limits: limits})
 }
 
 // LoadsJSON parses JSON text via the LOSSY mapping (SPEC §11.3) with the
@@ -1826,8 +1846,13 @@ func LoadsJSONWithLimits(text string, limits Limits) (Value, error) {
 		if we, ok := err.(*Error); ok { return nil, we }
 		return nil, newErr(ErrSyntax, fmt.Sprintf("JSON decode failed: %v", err), "WEFT_SYNTAX_JSON")
 	}
+	// EOF check — mirror the lossless loader: a clean EOF is the only
+	// acceptable outcome. A further token ("1 x") and a malformed tail
+	// ("1 \"unterminated") are both syntax errors, never silently dropped.
 	if _, err := dec.Token(); err == nil {
 		return nil, newErr(ErrSyntax, "unexpected trailing content in JSON", "WEFT_SYNTAX_JSON")
+	} else if err.Error() != "EOF" {
+		return nil, newErr(ErrSyntax, fmt.Sprintf("JSON decode failed: %v", err), "WEFT_SYNTAX_JSON")
 	}
 	return fromJSON(raw, true, 0, &convCtx{limits: limits})
 }
@@ -1863,7 +1888,17 @@ func fromJSON(j any, strict bool, depth int, ctx *convCtx) (Value, error) {
 		// lost. Map to Float — §11.3's integer rule needs the token text,
 		// which only the LoadsJSON path has.
 		return val, nil
-	case string: return val, nil
+	case string:
+		// Value-level entry points receive caller-built strings, which a
+		// Go program can fill with invalid UTF-8 (e.g. WTF-8 surrogate
+		// bytes). A Weft String is a Unicode scalar sequence (§5.7).
+		if !utf8.ValidString(val) {
+			return nil, newErr(ErrSyntax, "JSON string is not valid UTF-8 (Weft strings are Unicode scalar sequences)", "WEFT_SYNTAX_JSON")
+		}
+		if len(val) > ctx.limits.MaxStringBytes {
+			return nil, newErr(ErrLimit, fmt.Sprintf("string exceeds MaxStringBytes=%d", ctx.limits.MaxStringBytes), "WEFT_LIMIT_STRING")
+		}
+		return val, nil
 	case []any:
 		if err := ctx.depth(depth + 1); err != nil { return nil, err }
 		if err := ctx.coll(len(val)); err != nil { return nil, err }
@@ -2107,6 +2142,19 @@ func asOrderedMap(payload any) (*MapOrdered, bool) {
 	switch v := payload.(type) {
 	case *MapOrdered:
 		return v, true
+	case *orderedMapLosslessT:
+		// ToJSONLossless wraps the $map payload in this adapter so that
+		// json.Marshal writes keys in order. The adapter still holds the
+		// *un-converted* Weft values (it converts lazily at marshal
+		// time), so for the direct value-level round trip
+		// FromJSONLossless(ToJSONLossless(x)) we convert each value here,
+		// exactly as MarshalJSON would.
+		m := NewMap()
+		for _, k := range v.m.Keys {
+			m.Items[k] = ToJSONLossless(v.m.Items[k])
+			m.Keys = append(m.Keys, k)
+		}
+		return m, true
 	case map[string]any:
 		m := NewMap()
 		for k, val := range v {
@@ -2242,8 +2290,11 @@ func decodeAnyOrdered(dec *json.Decoder, depth int, limits Limits) (any, error) 
 				v, err := decodeAnyOrdered(dec, depth+1, limits)
 				if err != nil { return nil, err }
 				arr = append(arr, v)
-				if len(arr) > limits.MaxItemsPerColl {
-					return nil, newErr(ErrLimit, fmt.Sprintf("JSON array exceeds MaxItemsPerColl=%d", limits.MaxItemsPerColl), "WEFT_LIMIT_ITEMS")
+				// Structural bound only: a $sexpr array holds items+1 and
+				// tag objects wrap values, so the exact §9 Weft limit is
+				// enforced during conversion, not against the raw JSON.
+				if len(arr) > limits.MaxItemsPerColl*2+8 {
+					return nil, newErr(ErrLimit, fmt.Sprintf("JSON array exceeds structural bound (MaxItemsPerColl=%d)", limits.MaxItemsPerColl), "WEFT_LIMIT_ITEMS")
 				}
 			}
 			if _, err := dec.Token(); err != nil { return nil, err } // ']'
@@ -2263,8 +2314,9 @@ func decodeAnyOrdered(dec *json.Decoder, depth int, limits Limits) (any, error) 
 				if err != nil { return nil, err }
 				m.Items[k] = v
 				m.Keys = append(m.Keys, k)
-				if len(m.Keys) > limits.MaxItemsPerColl {
-					return nil, newErr(ErrLimit, fmt.Sprintf("JSON object exceeds MaxItemsPerColl=%d", limits.MaxItemsPerColl), "WEFT_LIMIT_ITEMS")
+				// Structural bound only — see the array case above.
+				if len(m.Keys) > limits.MaxItemsPerColl*2+8 {
+					return nil, newErr(ErrLimit, fmt.Sprintf("JSON object exceeds structural bound (MaxItemsPerColl=%d)", limits.MaxItemsPerColl), "WEFT_LIMIT_ITEMS")
 				}
 			}
 			if _, err := dec.Token(); err != nil { return nil, err } // '}'
@@ -2309,6 +2361,9 @@ func fromJSONLosslessLimited(j any, depth int, ctx *convCtx) (Value, error) {
 		if !isStrictIntPayload(s) {
 			return nil, newErr(ErrType, fmt.Sprintf("invalid integer form: %q", s), "WEFT_TYPE_INT")
 		}
+		if n := len(strings.TrimPrefix(s, "-")); n > ctx.limits.MaxIntDigits {
+			return nil, newErr(ErrLimit, fmt.Sprintf("integer has %d digits, exceeds MaxIntDigits=%d", n, ctx.limits.MaxIntDigits), "WEFT_LIMIT_INT")
+		}
 		// SPEC §11.2.1 rule 2 + W4-11: enforce JSON-safe range.
 		b, ok := new(big.Int).SetString(s, 10)
 		if !ok {
@@ -2320,6 +2375,22 @@ func fromJSONLosslessLimited(j any, depth int, ctx *convCtx) (Value, error) {
 				"WEFT_TYPE_INT")
 		}
 		return b, nil
+	case *big.Int:
+		// ToJSONLossless leaves JSON-safe integers as raw *big.Int in the
+		// value tree (json.Marshal writes them as plain numbers), so the
+		// direct round trip FromJSONLossless(ToJSONLossless(x)) must
+		// accept them. Outside the safe range the encoder emits the
+		// {"$int-big": ...} tagged form, so a raw out-of-range *big.Int
+		// is rejected exactly like an out-of-range number token.
+		if n := len(strings.TrimPrefix(val.String(), "-")); n > ctx.limits.MaxIntDigits {
+			return nil, newErr(ErrLimit, fmt.Sprintf("integer has %d digits, exceeds MaxIntDigits=%d", n, ctx.limits.MaxIntDigits), "WEFT_LIMIT_INT")
+		}
+		if val.Cmp(big.NewInt(safeIntMinJSONv)) < 0 || val.Cmp(big.NewInt(safeIntMaxJSONv)) > 0 {
+			return nil, newErr(ErrType,
+				`int outside JSON-safe range must use the {"$int-big": ...} tagged form`,
+				"WEFT_TYPE_INT")
+		}
+		return new(big.Int).Set(val), nil
 	case float64:
 		// Fallback: caller did not use UseNumber() and encoding/json
 		// has already collapsed the token to float64. We can't
@@ -2437,6 +2508,9 @@ func fromJSONLosslessLimited(j any, depth int, ctx *convCtx) (Value, error) {
 			s, ok := payload.(string)
 			if !ok {
 				return nil, newErr(ErrType, "$str payload must be a string", "WEFT_TYPE_STR")
+			}
+			if !utf8.ValidString(s) {
+				return nil, newErr(ErrSyntax, "$str payload is not valid UTF-8 (Weft strings are Unicode scalar sequences)", "WEFT_SYNTAX_JSON")
 			}
 			if len(s) > ctx.limits.MaxStringBytes {
 				return nil, newErr(ErrLimit, fmt.Sprintf("$str payload exceeds MaxStringBytes=%d", ctx.limits.MaxStringBytes), "WEFT_LIMIT_STRING")

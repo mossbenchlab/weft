@@ -81,6 +81,52 @@ expect_err("weft deep nesting early-rejected",
 expect_err("weft huge int digits rejected",
            lambda: weft.parse("1" * 20000), "WEFT_LIMIT_INT")
 
+# --- 1.0.1-rc2 regressions ------------------------------------------------
+# ReDoS: hostile pattern + long input must return quickly (linear engine)
+import time as _time
+from weft.schema import load_schema, validate
+_r = load_schema('(schema R (field x String :pattern "a+a+a+a+a+a+a+a+a+a+$"))')
+_t0 = _time.monotonic()
+_viol = validate(_r, {"x": "a" * 5000 + "!"}, "R")
+check("schema pattern linear-time (<1s) and correct",
+      _time.monotonic() - _t0 < 1.0 and len(_viol) == 1)
+check("unsupported pattern -> violation, not host engine",
+      len(validate(load_schema('(schema R (field x String :pattern "(?=a)b"))'),
+                   {"x": "b"}, "R")) == 1)
+
+# dumps/loads symmetry (both default to lossless)
+check("dumps/loads round trip for bare string",
+      weft.loads_json(weft.dumps_json("abc")) == "abc")
+check("dumps/loads keeps Float 1.0",
+      isinstance(weft.loads_json(weft.dumps_json(weft.parse("1.0"))), float))
+
+# value-level entry limits
+from weft import Limits
+expect_err("from_json string limit",
+           lambda: weft.from_json("ab", limits=Limits(max_string_bytes=1)),
+           "WEFT_LIMIT_STRING")
+expect_err("from_json_lossless int digits",
+           lambda: weft.from_json_lossless(123, limits=Limits(max_int_digits=1)),
+           "WEFT_LIMIT_INT")
+expect_err("loads_json lone-surrogate host str",
+           lambda: weft.loads_json('"' + chr(0xD800) + '"'))
+
+# tight limits must not break legitimate values via JSON tag overhead
+_lim = Limits(max_items_per_coll=1)
+_sx = weft.parse("(f 0)", limits=_lim)
+check("sexpr round trip under max_items_per_coll=1",
+      weft.equals(_sx, weft.loads_json(weft.dumps_json(_sx), limits=_lim)))
+
+# raised max_depth is actually usable (no RecursionError)
+_deep = "[" * 500 + "0" + "]" * 500
+check("depth-500 parse with max_depth=1024",
+      weft.format_value(weft.parse(_deep, limits=Limits(max_depth=1024))) != "")
+
+# raw/triple control rejection; hex strictness
+expect_err("raw DEL rejected", lambda: weft.parse('r"a\x7fb"'.replace("\\x7f", "\x7f")))
+expect_err("hex payload whitespace rejected",
+           lambda: weft.loads_json('{"$bin": {"enc": "hex", "data": "00 00"}}'))
+
 # --- int_max_str_digits immunity ----------------------------------------
 from weft.validators import dec_str_to_int
 check("chunked int conversion", dec_str_to_int("1" + "0" * 5000) == 10 ** 5000)

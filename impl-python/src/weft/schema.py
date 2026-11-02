@@ -1,130 +1,41 @@
 """Weft-Schema validator.
 
 Parses a schema (itself a Weft document) and validates target documents
-against it. See schema/SCHEMA_SPEC.md for the schema language.
+against it.
+
+``:pattern`` constraints use the linear-time engine in :mod:`weft.repat`
+(see its docstring for the exact supported subset). Patterns outside the
+subset — backreferences, lookaround, named groups, inline flags — are
+reported as ``WEFT_SCHEMA_PATTERN`` violations, never silently matched
+with a backtracking host engine.
 """
 from __future__ import annotations
 
 import datetime as _dt
-import os
-import re
-import signal
-import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from . import repat as _repat
 from .errors import WeftSchemaError
 from .parser import parse
 from .types import BigInt, Binary, Decimal, Keyword, Sexpr, Symbol, Typed, WeftDate
 
 
-# ReDoS protection operates in two layers:
-#   1. A syntactic lint that rejects known catastrophic shapes before the
-#      engine ever sees the pattern.
-#   2. A wall-clock cap on the match itself — SIGALRM on POSIX, a
-#      subprocess timeout on everything else (notably Windows).
+# Pattern matching (``:pattern``) uses the linear-time engine in
+# ``repat`` — a Thompson-NFA simulation with no backtracking, so a
+# hostile pattern cannot stall the caller and no timeout machinery is
+# needed. Compiled patterns are cached per schema-load process.
 
-class _RegexTimeout(Exception):
-    pass
+_PATTERN_CACHE: Dict[str, "_repat.Pattern"] = {}
 
 
-# Any quantifier: ``+``, ``*``, ``?``, ``{m,}``, ``{m,n}``, ``{m}``.
-_QUANT_FRAG = r"(?:[+*?]|\{\d+(?:,\d*)?\})"
-
-# Nested quantifier on a group: ``(…+)+``, ``(…{1,})+``, ``(…*)+``, …
-# The inner group may itself contain a quantified atom or a top-level
-# alternation of overlapping branches (which is the ``(a|aa)+`` shape).
-# The second disjunct catches ``(?=…)+`` and sibling look-arounds with a
-# trailing quantifier that would make them repeat.
-_REDOS_HINTS = re.compile(
-    r"\(\??[^)]*" + _QUANT_FRAG + r"[^)]*\)\s*" + _QUANT_FRAG   # (…q…)q
-    + r"|\(\?[=!][^)]*\)\s*" + _QUANT_FRAG                        # (?=…)q / (?!…)q
-    + r"|\([^)|]*\|[^)]*\)\s*" + _QUANT_FRAG                       # (a|b)q — approximate overlap
-)
-
-
-def _lint_regex_for_redos(pat: str) -> None:
-    """Reject obvious catastrophic-backtracking shapes.
-
-    Covers:
-    - Nested quantifiers: ``(a+)+``, ``(a*)+``, ``(a{1,})+``, ``(a?)+``.
-    - Quantified look-arounds: ``(?=…)+``.
-    - Alternation-under-repeat: ``(a|aa)+``. This is an *approximate*
-      filter — some benign ``(x|y)+`` patterns are rejected along with
-      the dangerous ones; schemas that need a precise alternation should
-      use a character class instead.
-
-    Patterns that defeat this filter still hit the wall-time cap in
-    :func:`_safe_fullmatch`.
-    """
-    if _REDOS_HINTS.search(pat):
-        raise WeftSchemaError(
-            f"regex pattern {pat!r} contains a nested-repeat shape "
-            "that can trigger catastrophic backtracking",
-            code="WEFT_SCHEMA_REDOS",
-        )
-
-
-def _timeout_handler(signum, frame):
-    raise _RegexTimeout()
-
-
-def _fullmatch_in_thread(pattern: str, text: str, timeout_sec: float) -> bool:
-    """Run ``re.fullmatch`` in a background thread so a runaway pattern
-    is bounded by wall time regardless of host OS.
-
-    This is the non-POSIX fallback (Windows, embedded, anywhere SIGALRM
-    is unavailable). A thread works even inside a daemonic
-    ``multiprocessing.Pool`` worker — subprocess-based timeouts fail
-    there with ``AssertionError: daemonic processes are not allowed to
-    have children``.
-
-    If the match doesn't finish within ``timeout_sec`` we raise
-    :class:`_RegexTimeout` to the caller. The worker thread is left to
-    finish on its own; Python has no safe way to kill it, so this
-    accepts a small background-CPU cost for runaway patterns in
-    exchange for not crashing or hanging the caller.
-    """
-    import threading as _threading
-    result: dict = {}
-    def _worker() -> None:
-        try:
-            result["ok"] = bool(re.fullmatch(pattern, text))
-        except re.error as e:
-            result["err"] = str(e)
-    t = _threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout_sec)
-    if t.is_alive():
-        raise _RegexTimeout()
-    if "err" in result:
-        raise re.error(result["err"])
-    return result.get("ok", False)
-
-
-def _safe_fullmatch(pattern: str, text: str, timeout_sec: float = 1.0) -> bool:
-    """Run ``re.fullmatch`` with both a syntactic lint and a wall-time cap.
-    The lint runs first; if the pattern passes, the match is executed
-    under a SIGALRM timer on POSIX and a background thread elsewhere.
-    """
-    _lint_regex_for_redos(pattern)
-    if os.name == "posix" and hasattr(signal, "SIGALRM"):
-        # SIGALRM only fires on the main thread. In worker threads it
-        # raises ValueError on ``signal.signal`` call; fall through to
-        # the thread-based timeout in that case.
-        import threading as _threading
-        if _threading.current_thread() is _threading.main_thread():
-            prev = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_sec)
-            try:
-                return bool(re.fullmatch(pattern, text))
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, prev)
-    # Non-POSIX or non-main-thread: use a background thread. This works
-    # inside daemonic ``multiprocessing.Pool`` workers too, which
-    # subprocess-based timeouts cannot.
-    return _fullmatch_in_thread(pattern, text, timeout_sec)
+def _compiled_pattern(src_pat: str) -> "_repat.Pattern":
+    p = _PATTERN_CACHE.get(src_pat)
+    if p is None:
+        p = _repat.compile_pattern(src_pat)
+        if len(_PATTERN_CACHE) < 1024:
+            _PATTERN_CACHE[src_pat] = p
+    return p
 
 
 class SchemaError(WeftSchemaError):
@@ -569,12 +480,10 @@ def _apply_constraints(value, constraints, path, violations):
         elif k == "pattern":
             if isinstance(value, str):
                 try:
-                    if not _safe_fullmatch(v, value):
+                    if not _compiled_pattern(v).fullmatch(value):
                         violations.append(Violation(path, "WEFT_SCHEMA_PATTERN", f"does not match /{v}/"))
-                except re.error as e:
-                    violations.append(Violation(path, "WEFT_SCHEMA_PATTERN", f"invalid regex: {e}"))
-                except _RegexTimeout:
-                    violations.append(Violation(path, "WEFT_SCHEMA_PATTERN", f"regex timeout (possible ReDoS): /{v}/"))
+                except WeftSchemaError as e:
+                    violations.append(Violation(path, "WEFT_SCHEMA_PATTERN", f"invalid pattern: {e}"))
         elif k == "items-min":
             if isinstance(value, list) and len(value) < v:
                 violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"items {len(value)} < {v}"))

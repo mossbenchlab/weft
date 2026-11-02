@@ -46,5 +46,28 @@ fn main() {
     // datetime `"` boundary
     assert!(parse("[#2026-11-02\"a\"]").is_ok());
 
+    // --- 1.0.1-rc2 regressions ---
+    // value-level entry limits
+    {
+        let mut lim = Limits::default();
+        lim.max_string_bytes = 1;
+        let j: serde_json::Value = serde_json::json!("ab");
+        assert!(weft::from_json_with_limits(&j, lim).is_err(), "from_json string limit");
+        let mut lim2 = Limits::default();
+        lim2.max_int_digits = 1;
+        let j2: serde_json::Value = serde_json::json!({"$bigint": "123"});
+        assert!(weft::from_json_lossless_with_limits(&j2, lim2).is_err(), "lossless bigint digits");
+    }
+    // deep value tree -> WEFT_LIMIT_DEPTH, not a stack crash
+    {
+        let mut deep = serde_json::json!(0);
+        for _ in 0..2000 { deep = serde_json::json!([deep]); }
+        assert!(weft::from_json(&deep).is_err(), "deep from_json must hit depth limit");
+        std::mem::forget(deep); // serde_json's own Drop is recursive
+    }
+    // raw/triple DEL/C1 rejected; dquote keeps accepting literal DEL
+    assert!(parse("r\"a\u{7f}b\"").is_err(), "raw DEL");
+    assert!(parse("\"\"\"a\u{85}b\"\"\"").is_err(), "triple C1");
+    assert!(parse("\"a\u{7f}b\"").is_ok(), "dquote literal DEL stays legal");
     println!("rust selftest OK");
 }

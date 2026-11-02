@@ -11,6 +11,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from run import impl_commands, run_driver  # noqa: E402
 
+def norm_lossless(out: str):
+    """Normalize a driver's ``tolossless`` output (OK\n<json>) to a
+    canonical compact sorted JSON text, so host serializer differences
+    (spacing, HTML escaping) vanish while payload-text differences —
+    e.g. {"$float": "1e-7"} vs "1e-07" — remain visible."""
+    if not out.startswith("OK\n"):
+        return None
+    try:
+        j = json.loads(out[3:])
+    except ValueError:
+        return None
+    return json.dumps(j, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def main():
     cmds = impl_commands(["py", "ts", "rs", "go"], build=False)
     cand = json.load(open(os.path.join(HERE, "candidates.json"), encoding="utf-8"))
@@ -35,6 +49,17 @@ def main():
             entry = {"id": cid, "spec": c.get("spec", ""), 
                      ("json" if kind.startswith("json") else "input"): data,
                      "canonical": out[3:]}
+            if not kind.startswith("json"):
+                # SPEC §11.2 payload texts must agree across hosts too
+                # (normalized JSON — catches e.g. a host-specific $float
+                # payload like "1e-7" where the spec requires "1e-07").
+                louts = {i: norm_lossless(run_driver(cmds[i], "tolossless", data))
+                         for i in cmds}
+                if None in louts.values() or len(set(louts.values())) != 1:
+                    disagreements.append((cid + " (tolossless)", 
+                                          {i: repr(v)[:140] for i, v in louts.items()}))
+                    continue
+                entry["lossless"] = louts["py"]
             (jvalid if kind.startswith("json") else valid).append(entry)
         elif kinds["py"] == "ERR":
             codes = {o.strip()[4:] for o in outs.values()}

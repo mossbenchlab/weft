@@ -134,6 +134,20 @@ pub fn from_json(v: &JVal) -> Result<Value> {
 }
 
 pub fn from_json_impl(v: &JVal, strict: bool) -> Result<Value> {
+    let mut ctx = ConvCtx { limits: Limits::default(), total: 0 };
+    from_json_ctx(v, strict, 0, &mut ctx)
+}
+
+/// `from_json` with explicit SPEC §9 limits — the value-level entry point
+/// enforces the same depth / total / per-collection / scalar limits as
+/// the text loader `loads_json`.
+pub fn from_json_with_limits(v: &JVal, limits: Limits) -> Result<Value> {
+    let mut ctx = ConvCtx { limits, total: 0 };
+    from_json_ctx(v, true, 0, &mut ctx)
+}
+
+fn from_json_ctx(v: &JVal, strict: bool, depth: usize, ctx: &mut ConvCtx) -> Result<Value> {
+    ctx.bump()?;
     match v {
         JVal::Null => Ok(Value::Null),
         JVal::Bool(b) => Ok(Value::Bool(*b)),
@@ -143,19 +157,30 @@ pub fn from_json_impl(v: &JVal, strict: bool) -> Result<Value> {
             else if let Some(f) = n.as_f64() { Ok(Value::Float(f)) }
             else { Err(WeftError::type_err("unrepresentable JSON number", "WEFT_TYPE_NUMBER")) }
         }
-        JVal::String(s) => Ok(Value::String(s.clone())),
+        JVal::String(s) => {
+            if s.len() > ctx.limits.max_string_bytes {
+                return Err(WeftError::limit(
+                    format!("string exceeds max_string_bytes={}", ctx.limits.max_string_bytes),
+                    "WEFT_LIMIT_STRING"));
+            }
+            Ok(Value::String(s.clone()))
+        }
         JVal::Array(xs) => {
+            ctx.depth(depth + 1)?;
+            ctx.coll(xs.len())?;
             let mut out = Vec::with_capacity(xs.len());
-            for x in xs { out.push(from_json_impl(x, strict)?); }
+            for x in xs { out.push(from_json_ctx(x, strict, depth + 1, ctx)?); }
             Ok(Value::List(out))
         }
         JVal::Object(obj) => {
+            ctx.depth(depth + 1)?;
+            ctx.coll(obj.len())?;
             let mut m = indexmap::IndexMap::new();
             for (k, v) in obj {
                 if strict && !is_valid_symbol(k) {
                     return Err(WeftError::type_err(format!("JSON key {:?} is not a valid Weft keyword", k), "WEFT_TYPE_KEY"));
                 }
-                m.insert(k.clone(), from_json_impl(v, strict)?);
+                m.insert(k.clone(), from_json_ctx(v, strict, depth + 1, ctx)?);
             }
             Ok(Value::Map(m))
         }
@@ -273,6 +298,19 @@ fn float_canonical_text(f: f64) -> String {
 /// uses the tagged form, so untagged inputs are rejected to preserve the
 /// round-trip identity ``from_json_lossless(to_json_lossless(x)) == x``.
 pub fn from_json_lossless(v: &JVal) -> Result<Value> {
+    from_json_lossless_with_limits(v, Limits::default())
+}
+
+/// `from_json_lossless` with explicit SPEC §9 limits — the value-level
+/// entry point enforces the same limits as the text loader
+/// `loads_json_lossless`.
+pub fn from_json_lossless_with_limits(v: &JVal, limits: Limits) -> Result<Value> {
+    let mut ctx = ConvCtx { limits, total: 0 };
+    from_json_lossless_ctx(v, 0, &mut ctx)
+}
+
+fn from_json_lossless_ctx(v: &JVal, depth: usize, ctx: &mut ConvCtx) -> Result<Value> {
+    ctx.bump()?;
     match v {
         JVal::Null => Ok(Value::Null),
         JVal::Bool(b) => Ok(Value::Bool(*b)),
@@ -337,9 +375,9 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                             "WEFT_TYPE_BIGINT"));
                     }
                     let n_digits = s.trim_start_matches('-').len();
-                    if n_digits > Limits::default().max_int_digits {
+                    if n_digits > ctx.limits.max_int_digits {
                         return Err(WeftError::limit(
-                            format!("$bigint payload has {} digits, exceeds max_int_digits={}", n_digits, Limits::default().max_int_digits),
+                            format!("$bigint payload has {} digits, exceeds max_int_digits={}", n_digits, ctx.limits.max_int_digits),
                             "WEFT_LIMIT_INT"));
                     }
                     let b: BigInt = s.parse().map_err(|_| WeftError::type_err(format!("$bigint payload invalid: {:?}", s), "WEFT_TYPE_BIGINT"))?;
@@ -353,9 +391,9 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                             "WEFT_TYPE_INT"));
                     }
                     let n_digits = s.trim_start_matches('-').len();
-                    if n_digits > Limits::default().max_int_digits {
+                    if n_digits > ctx.limits.max_int_digits {
                         return Err(WeftError::limit(
-                            format!("$int-big payload has {} digits, exceeds max_int_digits={}", n_digits, Limits::default().max_int_digits),
+                            format!("$int-big payload has {} digits, exceeds max_int_digits={}", n_digits, ctx.limits.max_int_digits),
                             "WEFT_LIMIT_INT"));
                     }
                     let b: BigInt = s.parse().map_err(|_| WeftError::type_err(format!("$int-big payload invalid: {:?}", s), "WEFT_TYPE_INT"))?;
@@ -369,6 +407,11 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                 }
                 "$str" => {
                     let s = payload.as_str().ok_or_else(|| WeftError::type_err("$str payload must be a string", "WEFT_TYPE_STR"))?;
+                    if s.len() > ctx.limits.max_string_bytes {
+                        return Err(WeftError::limit(
+                            format!("$str payload exceeds max_string_bytes={}", ctx.limits.max_string_bytes),
+                            "WEFT_LIMIT_STRING"));
+                    }
                     Ok(Value::String(s.into()))
                 }
                 "$bin" => {
@@ -440,8 +483,10 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                     // produce text that re-parses as something else.
                     let tag_sym = Symbol::new(tag_name)
                         .map_err(|e| WeftError::type_err(format!("$sexpr tag is not a valid Symbol name: {}", e), "WEFT_TYPE_SEXPR"))?;
+                    ctx.depth(depth + 1)?;
+                    ctx.coll(arr.len() - 1)?;
                     let mut items = Vec::with_capacity(arr.len() - 1);
-                    for a in &arr[1..] { items.push(from_json_lossless(a)?); }
+                    for a in &arr[1..] { items.push(from_json_lossless_ctx(a, depth + 1, ctx)?); }
                     Ok(Value::Sexpr(Sexpr { tag: tag_sym, items }))
                 }
                 "$typed" => {
@@ -449,8 +494,9 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                     if inner.len() != 2 || !inner.contains_key("v") || !inner.contains_key("t") {
                         return Err(WeftError::type_err("$typed payload must be {v,t}", "WEFT_TYPE_TYPED"));
                     }
-                    let value = from_json_lossless(&inner["v"])?;
-                    let t_val = from_json_lossless(&inner["t"])?;
+                    ctx.depth(depth + 1)?;
+                    let value = from_json_lossless_ctx(&inner["v"], depth + 1, ctx)?;
+                    let t_val = from_json_lossless_ctx(&inner["t"], depth + 1, ctx)?;
                     let te = match t_val {
                         Value::Symbol(s) => TypeExpr::Name(s),
                         Value::Sexpr(s) => TypeExpr::Form(s),
@@ -460,18 +506,22 @@ pub fn from_json_lossless(v: &JVal) -> Result<Value> {
                 }
                 "$list" => {
                     let arr = payload.as_array().ok_or_else(|| WeftError::type_err("$list payload must be an array", "WEFT_TYPE_LIST"))?;
+                    ctx.depth(depth + 1)?;
+                    ctx.coll(arr.len())?;
                     let mut out = Vec::with_capacity(arr.len());
-                    for a in arr { out.push(from_json_lossless(a)?); }
+                    for a in arr { out.push(from_json_lossless_ctx(a, depth + 1, ctx)?); }
                     Ok(Value::List(out))
                 }
                 "$map" => {
                     let inner = payload.as_object().ok_or_else(|| WeftError::type_err("$map payload must be an object", "WEFT_TYPE_MAP"))?;
+                    ctx.depth(depth + 1)?;
+                    ctx.coll(inner.len())?;
                     let mut m = indexmap::IndexMap::new();
                     for (k, v) in inner {
                         if !is_valid_symbol(k) {
                             return Err(WeftError::type_err(format!("$map key {:?} is not a valid Weft keyword name (would break structure on re-parse)", k), "WEFT_TYPE_KEY"));
                         }
-                        m.insert(k.clone(), from_json_lossless(v)?);
+                        m.insert(k.clone(), from_json_lossless_ctx(v, depth + 1, ctx)?);
                     }
                     Ok(Value::Map(m))
                 }
@@ -1038,7 +1088,7 @@ fn from_lex_lossless(node: &JsonLex, depth: usize, ctx: &mut ConvCtx) -> Result<
                     // the serde-based handlers; their payloads are small by
                     // construction, so bridging to JVal is safe.
                     let j = lex_to_jval(node)?;
-                    from_json_lossless(&j)
+                    from_json_lossless_ctx(&j, depth, ctx)
                 }
             }
         }

@@ -298,5 +298,29 @@
   "spec": "§5.10",
   "input": "Ⅰx",
   "code": "WEFT_SYNTAX_CHAR"
+ },
+ {
+  "id": "v3-raw-del-reject",
+  "spec": "§5.7",
+  "input": "r\"ab\"",
+  "code": "WEFT_SYNTAX_STR_CTRL"
+ },
+ {
+  "id": "v3-raw-c1-reject",
+  "spec": "§5.7",
+  "input": "r\"ab\"",
+  "code": "WEFT_SYNTAX_STR_CTRL"
+ },
+ {
+  "id": "v3-triple-c1-reject",
+  "spec": "§5.7",
+  "input": "\"\"\"ab\"\"\"",
+  "code": "WEFT_SYNTAX_STR_CTRL"
+ },
+ {
+  "id": "v3-triple-del-reject",
+  "spec": "§5.7",
+  "input": "\"\"\"ab\"\"\"",
+  "code": "WEFT_SYNTAX_STR_CTRL"
  }
 ]

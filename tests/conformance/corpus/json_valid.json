@@ -64,5 +64,17 @@
   "spec": "§5.10/§11.2.3",
   "json": "{\"$map\":{\"𝐀x\": 1}}",
   "canonical": "{:𝐀x 1}\n"
+ },
+ {
+  "id": "v3-json-float-1e-07",
+  "spec": "§11.2.1",
+  "json": "{\"$float\": \"1e-07\"}",
+  "canonical": "1e-07\n"
+ },
+ {
+  "id": "v3-json-float-noncanon-payload",
+  "spec": "§11.2.1",
+  "json": "{\"$float\": \"1e-7\"}",
+  "canonical": "1e-07\n"
  }
 ]

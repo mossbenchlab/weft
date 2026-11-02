@@ -69,6 +69,31 @@ expectErr("weft deep nesting early-rejected",
 expectErr("weft huge int digits rejected",
   () => weft.parse("1".repeat(20000)), "WEFT_LIMIT_INT");
 
+// --- 1.0.1-rc2 regressions -------------------------------------------------
+// dumps/loads symmetry
+check("dumps/loads round trip for bare string", weft.loadsJson(weft.dumpsJson("abc")) === "abc");
+check("dumps/loads keeps Float 1.0", typeof weft.loadsJson(weft.dumpsJson(weft.parse("1.0"))) === "number");
+// JSON tag overhead must not count against Weft limits
+{
+  const lim = weft.makeLimits({max_items_per_coll: 1});
+  const sx = weft.parse("(f 0)", {limits: lim});
+  check("sexpr round trip under max_items_per_coll=1",
+    weft.equals(sx, weft.loadsJson(weft.dumpsJson(sx), {limits: lim})));
+  const lim2 = weft.makeLimits({max_string_bytes: 1});
+  check("$str tag name not counted against max_string_bytes",
+    weft.loadsJson('{"$str":"a"}', {limits: lim2}) === "a");
+}
+// object-entry Unicode + limits
+expectErr("fromJsonLossless lone surrogate rejected",
+  () => weft.fromJsonLossless(JSON.parse('{"$str":"\ud800"}')), "WEFT_SYNTAX_JSON");
+expectErr("fromJson string limit",
+  () => weft.fromJson("ab", {limits: weft.makeLimits({max_string_bytes: 1})}), "WEFT_LIMIT_STRING");
+// $float payload uses the strict formatter text
+check("$float payload 1e-07", JSON.stringify(weft.toJsonLossless(weft.parse("1e-7"))) === '{"$float":"1e-07"}');
+check("$float payload 1e+20", JSON.stringify(weft.toJsonLossless(weft.parse("1e20"))) === '{"$float":"1e+20"}');
+// raw/triple DEL/C1 rejection
+expectErr("raw DEL rejected", () => weft.parse('r"a\u007fb"'.replace("\\u007f", "\u007f")));
+
 console.log();
 if (fails) { console.log(fails + " FAILURES"); process.exit(1); }
 console.log("ALL TYPESCRIPT SELF-TESTS PASSED");

@@ -168,5 +168,26 @@
   "id": "v2-json-2pow53plus1",
   "spec": "§11.2.1",
   "json": "9007199254740993"
+ },
+ {
+  "id": "v3-json-hex-ws-reject",
+  "spec": "§11.2",
+  "json": "{\"$bin\": {\"enc\": \"hex\", \"data\": \"00 00\"}}"
+ },
+ {
+  "id": "v3-json-hex-odd-reject",
+  "spec": "§11.2",
+  "json": "{\"$bin\": {\"enc\": \"hex\", \"data\": \"0\"}}"
+ },
+ {
+  "id": "v3-json-trailing-token",
+  "spec": "§11.2",
+  "json": "{\"$list\": []} x",
+  "code": "WEFT_SYNTAX_JSON"
+ },
+ {
+  "id": "v3-json-rev-surrogates",
+  "spec": "§5.7",
+  "json": "{\"$str\": \"\\udc00\\ud800\"}"
  }
 ]

@@ -39,7 +39,11 @@ def _read_text(path: str) -> str:
         if path == "-":
             data = sys.stdin.buffer.read()
             return data.decode("utf-8")
-        return Path(path).read_text(encoding="utf-8")
+        # read_bytes + decode — ``read_text`` performs universal-newline
+        # translation, which would silently turn a CRLF inside a raw or
+        # triple-quoted string into LF (SPEC §5.7 requires byte-exact
+        # preservation). File and stdin input must behave identically.
+        return Path(path).read_bytes().decode("utf-8")
     except UnicodeDecodeError as e:
         _die(f"input is not valid UTF-8 ({e.reason} at byte {e.start})", 2)
         raise  # unreachable; _die exits
@@ -66,10 +70,13 @@ def _write_text(text: str, path: str | None) -> None:
             if not text.endswith("\n"):
                 sys.stdout.write("\n")
     else:
-        # Explicit newline='' so ``\n`` in Weft output isn't translated
-        # to the host's convention — the canonical form uses LF only.
-        with open(path, "w", encoding="utf-8", newline="") as fp:
-            fp.write(text)
+        # Binary write: identical bytes for stdout, file, and in-place —
+        # canonical output ends with exactly one LF everywhere.
+        encoded = text.encode("utf-8")
+        if not encoded.endswith(b"\n"):
+            encoded += b"\n"
+        with open(path, "wb") as fp:
+            fp.write(encoded)
 
 
 def _die(msg: str, code: int = 2) -> None:
@@ -102,12 +109,13 @@ def cmd_format(args: argparse.Namespace) -> int:
     )
     out = format_value(v, opts)
     if args.in_place:
-        # LF only — ``write_text`` under the default text-mode newline
-        # would translate ``\n`` to CRLF on Windows.
-        with open(args.path, "w", encoding="utf-8", newline="") as fp:
-            fp.write(out)
+        encoded = out.encode("utf-8")
+        if not encoded.endswith(b"\n"):
+            encoded += b"\n"
+        with open(args.path, "wb") as fp:
+            fp.write(encoded)
     else:
-        _write_text(out.rstrip("\n"), args.output)
+        _write_text(out, args.output)
     return 0
 
 
@@ -128,10 +136,9 @@ def cmd_to_json(args: argparse.Namespace) -> int:
     except WeftError as e:
         _die(str(e), 2)
     if args.lossy:
-        out = dumps_json(v, indent=2 if args.pretty else None)
+        out = dumps_json(v, lossless=False, indent=2 if args.pretty else None)
     else:
-        out = json.dumps(to_json_lossless(v), indent=2 if args.pretty else None,
-                         ensure_ascii=False)
+        out = dumps_json(v, indent=2 if args.pretty else None)
     _write_text(out, args.output)
     return 0
 
@@ -150,7 +157,7 @@ def cmd_from_json(args: argparse.Namespace) -> int:
     except WeftError as e:
         _die(str(e), 2)
         return 2  # unreachable
-    _write_text(out.rstrip("\n"), args.output)
+    _write_text(out, args.output)
     return 0
 
 

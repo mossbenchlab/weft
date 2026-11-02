@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	weft "github.com/homeaibase-design/weft/impl-go"
 )
@@ -57,5 +58,52 @@ func main() {
 	_, err = weft.Parse("[#2026-11-02\"a\"]")
 	must(err == nil, "dt-quote boundary")
 
+		// --- 1.0.1-rc2 regressions ---
+	// direct value-level round trip (no marshal step)
+	{
+		v, _ := weft.Parse("{:a 1 :b [1.5 2n]}")
+		v2, err := weft.FromJSONLossless(weft.ToJSONLossless(v))
+		if err != nil || !weft.Equals(v, v2) {
+			fmt.Println("FAIL direct FromJSONLossless(ToJSONLossless) round trip:", err)
+			os.Exit(1)
+		}
+	}
+	// lossy loader must reject trailing garbage
+	if _, err := weft.LoadsJSON("1 x"); err == nil {
+		fmt.Println("FAIL LoadsJSON accepted trailing token")
+		os.Exit(1)
+	}
+	// dumps/loads lossless symmetry
+	{
+		v, _ := weft.Parse("\"abc\"")
+		b, _ := weft.DumpJSONLossless(v)
+		v2, err := weft.LoadsJSONLossless(string(b))
+		if err != nil || !weft.Equals(v, v2) {
+			fmt.Println("FAIL DumpJSONLossless/LoadsJSONLossless round trip")
+			os.Exit(1)
+		}
+	}
+	// tag overhead must not count against Weft limits
+	{
+		lim := weft.DefaultLimits()
+		lim.MaxItemsPerColl = 1
+		sx, _ := weft.ParseWithLimits("(f 0)", lim)
+		b, _ := weft.DumpJSONLossless(sx)
+		v2, err := weft.LoadsJSONLosslessWithLimits(string(b), lim)
+		if err != nil || !weft.Equals(sx, v2) {
+			fmt.Println("FAIL sexpr round trip under MaxItemsPerColl=1:", err)
+			os.Exit(1)
+		}
+	}
+	// invalid UTF-8 host string rejected at the value-level entry
+	if _, err := weft.FromJSON(string([]byte{0xED, 0xA0, 0x80})); err == nil {
+		fmt.Println("FAIL FromJSON accepted WTF-8 lone surrogate bytes")
+		os.Exit(1)
+	}
+	// raw DEL rejected
+	if _, err := weft.Parse("r\"a\x7fb\""); err == nil {
+		fmt.Println("FAIL raw DEL accepted")
+		os.Exit(1)
+	}
 	fmt.Println("go selftest OK")
 }

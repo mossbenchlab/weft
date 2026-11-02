@@ -132,6 +132,7 @@ def _bigint_to_decimal_str(n: Any, max_int_digits: int) -> str:
 
 
 import dataclasses as _dataclasses
+from .parser import _recursion_headroom as _rec_headroom
 
 
 def format_value(value: Any, options: Optional[FormatOptions] = None) -> str:
@@ -151,7 +152,10 @@ def format_value(value: Any, options: Optional[FormatOptions] = None) -> str:
             strict_canonical=True,
             max_width=10**12,
         )
-    rendered = _format(value, 0, opt)
+    # The same stack headroom rule as parse(): any tree §9 limits admit
+    # (hard max_depth 1024) must format without a host RecursionError.
+    with _rec_headroom(1024):
+        rendered = _format(value, 0, opt)
     if not rendered.endswith("\n"):
         rendered += "\n"
     return rendered

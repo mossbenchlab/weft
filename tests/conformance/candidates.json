@@ -1288,5 +1288,101 @@
   "kind": "weft",
   "input": "#2016-12-31T23:59:60Z",
   "spec": "§5.9"
+ },
+ {
+  "id": "v3-raw-del-reject",
+  "kind": "weft",
+  "input": "r\"ab\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-raw-c1-reject",
+  "kind": "weft",
+  "input": "r\"ab\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-triple-c1-reject",
+  "kind": "weft",
+  "input": "\"\"\"ab\"\"\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-triple-del-reject",
+  "kind": "weft",
+  "input": "\"\"\"ab\"\"\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-raw-bidi-ok",
+  "kind": "weft",
+  "input": "r\"a‮b\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-raw-crlf-preserved",
+  "kind": "weft",
+  "input": "r\"a\r\nb\"",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-sym-colon-boundary",
+  "kind": "weft",
+  "input": "[foo:bar]",
+  "spec": "§4.3"
+ },
+ {
+  "id": "v3-float-1e-07-payload",
+  "kind": "weft",
+  "input": "1e-7",
+  "spec": "§11.2.1"
+ },
+ {
+  "id": "v3-float-1e20-payload",
+  "kind": "weft",
+  "input": "1e20",
+  "spec": "§11.2.1"
+ },
+ {
+  "id": "v3-float-tie-payload",
+  "kind": "weft",
+  "input": "5.797201e-41",
+  "spec": "§11.2.1"
+ },
+ {
+  "id": "v3-json-hex-ws-reject",
+  "kind": "json",
+  "input": "{\"$bin\": {\"enc\": \"hex\", \"data\": \"00 00\"}}",
+  "spec": "§11.2"
+ },
+ {
+  "id": "v3-json-hex-odd-reject",
+  "kind": "json",
+  "input": "{\"$bin\": {\"enc\": \"hex\", \"data\": \"0\"}}",
+  "spec": "§11.2"
+ },
+ {
+  "id": "v3-json-trailing-token",
+  "kind": "json",
+  "input": "{\"$list\": []} x",
+  "spec": "§11.2"
+ },
+ {
+  "id": "v3-json-rev-surrogates",
+  "kind": "json",
+  "input": "{\"$str\": \"\\udc00\\ud800\"}",
+  "spec": "§5.7"
+ },
+ {
+  "id": "v3-json-float-1e-07",
+  "kind": "json",
+  "input": "{\"$float\": \"1e-07\"}",
+  "spec": "§11.2.1"
+ },
+ {
+  "id": "v3-json-float-noncanon-payload",
+  "kind": "json",
+  "input": "{\"$float\": \"1e-7\"}",
+  "spec": "§11.2.1"
  }
 ]
