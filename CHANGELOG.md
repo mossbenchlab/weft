@@ -1,0 +1,106 @@
+# Changelog
+
+## 1.0.1 — 2026-11-02
+
+Security- and conformance-focused revision. No new syntax. All changes
+verified by the four-implementation differential harness
+(`tests/conformance/` + fuzz).
+
+### Specification
+
+- **§7.3 float tie rule corrected**: shortest round-trip ties pick the
+  spelling **closest to the exact binary value** (equidistant → even last
+  digit). The previous "banker's even" wording did not match what CPython /
+  V8 / Go emit (differential measurement: 61/61 ties resolved by
+  closeness, 18/61 by evenness) and would have made conforming
+  implementations diverge from all three hosts.
+- **§5.9/§7.2 fractional seconds**: an all-zero fraction is removed
+  entirely (`.000` → gone). The 1.0 draft's "keep `.0`" rule required a
+  presence flag that no value model carries and no implementation had.
+- **§6 ABNF**: base prefixes `0x/0X`, `0o/0O`, `0b/0B` and the exponent
+  marker `e/E` accept both cases (matching every implementation and the
+  §5.5 prose); everything else stays case-sensitive. `map` / `sexpr`
+  element separators relaxed from `1*WS` to `*WS` (matching the §4.3
+  token-boundary rule: `{:a[1 2]}` is valid).
+- **§7.3 `\u{HEX}`** escapes use uppercase hex digits (matching all four
+  implementations).
+- **§5.16 Decimal equality** defined as normalised-text equality
+  (leading `+` stripped, exponent marker lowercased) instead of the
+  unimplementable "numeric value + scale" rule.
+- **§14 pins Unicode 15.0** for the `L*` identifier classes (was a
+  dangling reference).
+
+### All implementations
+
+- `equals(a, b)` (§5.16) implemented: iterative, NaN ≢ NaN, `-0.0 ≢ 0.0`
+  (bit identity), `42 ≡ 42n`, Binary compares bytes.
+- Lossless JSON decoding now enforces the §9 limits (depth, total items,
+  items per collection, string bytes, int digits) on every entry point and
+  rejects duplicate object keys with `WEFT_SYNTAX_JSON_DUPKEY` (§11.2.5).
+- Lexical JSON reading (SPEC §11.2.1 rule 4 / §11.3): `1` vs `1.0` is
+  decided by token text, not host float value.
+  - Python: `loads_json` (lossless by default) with `object_pairs_hook`,
+    `parse_int`/`parse_constant` hooks and a string-aware depth pre-scan.
+  - TypeScript: new `parseJsonLexical` reader + `loadsJson` (lossless by
+    default); `fromJsonLossless`/`fromJson` are now iterative.
+  - Rust: new `parse_json_lexical` reader + `loads_json` /
+    `loads_json_lossless`.
+  - Go: `LoadsJSON` / `LoadsJSONLossless` (+`WithLimits` variants) over the
+    ordered token walker.
+- Canonical soft-wrap counts Unicode code points in all four
+  implementations (§7.2; TS previously counted UTF-16 units, Rust/Go
+  UTF-8 bytes).
+- Datetime literals terminate at `"` (§4.3): `[#2026-11-02"a"]` parses.
+- Decimal `+` sign is stripped at construction in all four (§7.2, §5.16).
+- Binary canonical output is always `base64:` (§5.8/§7.2).
+
+### Per-implementation fixes
+
+- **Python**: shipped the previously missing `weft/validators.py`
+  (base64 canonical check, `-?[0-9]+` payload shape, §7.3 escape set);
+  `$bigint`/`$int-big` payloads up to `max_int_digits` decode via chunked
+  conversion (no longer capped at CPython's 4300-digit `int()` limit);
+  `loads_json` rejects `NaN`/`Infinity`, converts huge integer tokens
+  safely, and maps host exceptions to Weft errors; CLI `to-json` /
+  `from-json` default to the lossless mapping (`--lossy` opts out);
+  stdlib `date`/`datetime` with year < 1000 format zero-padded;
+  schema `unique` uses bit-identity for floats; `DECIMAL` tokens carry
+  `byte_offset`.
+- **TypeScript**: lossy `toJson` no longer drops `__proto__` map entries
+  (null-prototype objects + `defineProperty`, same as the lossless path);
+  strict-canonical key sort uses code-point order on all inputs.
+- **Rust**: identifier classes use the real Unicode `L*` general category
+  (previously `is_alphabetic && !is_numeric`, which admitted
+  Other_Alphabetic combining marks such as U+0345); float formatting
+  implements the §7.3 tie rule exactly (big-integer midpoint comparison)
+  instead of delegating to `std` `Display`; `serde_json` is pinned with
+  `preserve_order`; lossless `$map` decoding keeps insertion order.
+- **Go**: the ordered JSON token walker is depth-bounded — deeply nested
+  input now fails with `WEFT_LIMIT_DEPTH` instead of exhausting the
+  goroutine stack and aborting the process; `FromJSON` understands
+  `json.Number` (lexical int/float) and `*MapOrdered`.
+
+### Packaging
+
+- Build manifests shipped for all four implementations (`pyproject.toml`,
+  `package.json`+`tsconfig.json`, `Cargo.toml` with
+  `serde_json/preserve_order` pinned, `go.mod`).
+- Language-neutral conformance corpus (`tests/conformance/`) and CI that
+  rebuilds all four implementations from this repository and runs the
+  corpus plus differential fuzz on every change.
+- `SECURITY.md` with a reporting route (SPEC §10.9 now resolves).
+
+### Infrastructure (new in 1.0.1)
+
+- `tests/conformance/`: language-neutral conformance suite — 215-case corpus
+  generated by 4-way agreement, byte-exact canonical checks, lossless-JSON
+  round-trip identity (canonical bytes; `equals()` additionally, NaN-aware).
+- `tests/fuzz/diff_fuzz.py`: deterministic differential fuzzer (structural
+  documents + random float64 bit patterns) across all four implementations.
+- `tests/check_package.py`: package completeness + version-lockstep check
+  (guards the missing-module bug class found in review).
+- `.github/workflows/ci.yml`: builds all four implementations, runs
+  self-tests, conformance, fuzz, and completeness checks on every push.
+- `SECURITY.md` (threat model + private reporting; resolves SPEC §10.9),
+  `README.md`, `LICENSE` (MIT).
+- Per-implementation self-tests covering every 1.0.1 regression class.

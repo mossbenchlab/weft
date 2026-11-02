@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+node_modules/
+dist/
+out/
+target/
+tests/conformance/drivers/tsout/
+tests/conformance/drivers/bin-go
+tests/conformance/drivers/globals.d.ts

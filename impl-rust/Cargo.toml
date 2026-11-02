@@ -1,0 +1,14 @@
+[package]
+name = "weft"
+version = "1.0.1"
+edition = "2021"
+description = "Weft 1.0 — AI-first structured data format (Rust reference implementation)"
+license = "MIT"
+
+[dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+base64 = "0.22"
+indexmap = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-general-category = "1"

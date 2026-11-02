@@ -1,0 +1,16 @@
+{
+  "name": "weft",
+  "version": "1.0.1",
+  "description": "Weft 1.0 \u2014 AI-first structured data format (TypeScript reference implementation)",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node tests/selftest.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.5",
+    "@types/node": "^22"
+  }
+}

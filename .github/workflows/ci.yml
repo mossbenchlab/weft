@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  conformance:
+    name: Build all four implementations + conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install TypeScript (for the conformance driver build)
+        run: npm install -g typescript
+
+      # ---- per-implementation builds & self-tests --------------------
+      - name: Python self-test
+        run: |
+          cd impl-python
+          python -c "import sys; sys.path.insert(0,'src'); import weft; print('weft', weft.__version__)"
+          python tests/selftest.py
+
+      - name: TypeScript build + self-test
+        run: |
+          cd impl-typescript
+          npm install
+          npm run build
+          npm test
+
+      - name: Rust build + self-test
+        run: |
+          cd impl-rust
+          cargo build --release
+          cargo run --release --bin selftest
+
+      - name: Go build + self-test
+        run: |
+          cd impl-go
+          go vet ./...
+          go build ./...
+          go run ./selftest
+
+      # ---- cross-implementation conformance --------------------------
+      - name: Conformance suite (all 4 implementations, byte-exact)
+        run: python3 tests/conformance/run.py --build
+
+      # ---- differential fuzzing (bounded, deterministic seed) ---------
+      - name: Differential fuzz
+        run: python3 tests/fuzz/diff_fuzz.py --structs 500 --floats 1000 --seed 20261102
+
+      # ---- package completeness -------------------------------------
+      - name: Package completeness check
+        run: python3 tests/check_package.py
