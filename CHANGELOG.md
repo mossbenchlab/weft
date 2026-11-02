@@ -291,3 +291,33 @@ untouched since the original review target.
   SCHEMA-PATTERN.md as supported with `m` defaulting to 0.
 - Fixed a path-join bug for Map values validated at a memo root
   (`R.x..k` → `R.x.k`).
+
+## 1.0.1-rc5 (external review round 6 fixes — constraint handling)
+
+Round 6 confirmed all rc4 fixes and found no new core issues; the three
+findings were in the constraint layer next to the rc4 validator rewrite.
+
+### P1
+- **`:unique` is collision-resistant.** The equality key for duplicate
+  detection was a tuple carrying raw host ints, and CPython hashes an
+  int as its value mod 2^61-1 — hostile input can mint unlimited
+  distinct integers with identical hashes and turn the `seen` set into
+  quadratic probing (25,000 crafted ints exceeded a 4 s watchdog; same
+  count of ordinary ints took 0.07 s). The key is now a flat canonical
+  **string** fingerprint (ints by decimal text), hashed with Python's
+  process-keyed SipHash, which hostile input cannot target: the same
+  25,000-value input now validates in ~0.07 s. §5.16 semantics are
+  preserved and regression-tested (1 ≡ 1n, nan ≢ nan, -0.0 ≠ 0.0,
+  order-insensitive maps, content-equal Binary, Decimal scale).
+
+### P2
+- **Fingerprint construction is iterative** (explicit stack) and counts
+  against the validation step budget — a depth-500/1000 value under
+  `:unique` no longer raises RecursionError.
+- **All remaining diagnostic paths are host-safe**: `:min-length` /
+  `:max-length` / `:items-min` / `:items-max` / the NaN-vs-bound
+  message, and the schema-load parse errors now render values through
+  `_diag()`; a 4,301-digit integer anywhere in a schema or document
+  produces a normal violation or parse error (CLI included), never the
+  host's int_max_str_digits ValueError. Length/items bounds also accept
+  BigInt-typed constraint values safely.

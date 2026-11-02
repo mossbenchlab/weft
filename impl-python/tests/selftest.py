@@ -240,6 +240,53 @@ check("{,n} supported", compile_pattern("a{,2}").fullmatch("aa")
 expect_err("well-formed over-limit count rejected",
            lambda: compile_pattern("a{1001}"))
 
+# --- 1.0.1-rc5 regressions (constraint handling) ------------------------------
+# R6-1: hash-collision integers in :unique stay near-linear
+import sys as _sys2
+_P = _sys2.hash_info.modulus
+_ru = _ls("(schema R (field x (List Int) :unique true))")
+_dc = weft.parse("{:x [" + " ".join(str(_P * i) for i in range(1, 8001)) + "]}")
+_t0 = _t2.monotonic()
+check("8000 hash-colliding ints under :unique in <2s, 0 violations",
+      _val(_ru, _dc, "R") == [] and _t2.monotonic() - _t0 < 2.0)
+
+# R6-3: deep value under :unique — no host recursion
+_ra = _ls("(schema R (field x (List Any) :unique true))")
+_dd = weft.parse("{:x [" + "[" * 500 + "0" + "]" * 500 + "]}",
+                 limits=Limits(max_depth=1024))
+check("depth-500 value under :unique", _val(_ra, _dd, "R") == [])
+
+# :unique semantics preserved by the fingerprint (§5.16)
+def _codes(doc):
+    return _val(_ra, weft.parse(doc), "R")
+check("unique: 1 ≡ 1n", _codes("{:x [1 1n]}") != [])
+check("unique: nan ≢ nan", _codes("{:x [nan nan]}") == [])
+check("unique: -0.0 ≠ 0.0", _codes("{:x [-0.0 0.0]}") == [])
+check("unique: map order-insensitive", _codes("{:x [{:a 1 :b 2} {:b 2 :a 1}]}") != [])
+check("unique: binary by content", _codes('{:x [b"hex:00ff" b"base64:AP8="]}') != [])
+
+# R6-2: huge ints anywhere in diagnostics never leak ValueError
+_big = "9" * 4301
+for _name, _s, _doc in [
+    (":min-length", "(schema R (field x String :min-length " + _big + "))", '{:x ""}'),
+    (":items-min", "(schema R (field x (List Int) :items-min " + _big + "))", "{:x []}"),
+    ("Float :max + nan", "(schema R (field x Float :max " + _big + "))", "{:x nan}"),
+]:
+    try:
+        _vv = _val(_ls(_s), weft.parse(_doc), "R")
+        check(f"huge-int diag {_name}", len(_vv) == 1)
+    except ValueError:
+        check(f"huge-int diag {_name} (ValueError leak)", False)
+for _name, _sch in [("schema form big int", "(schema R " + _big + ")"),
+                    ("schema doc big int", _big)]:
+    try:
+        _ls(_sch)
+        check(_name, False)
+    except weft.WeftError:
+        check(_name, True)
+    except ValueError:
+        check(_name + " (ValueError leak)", False)
+
 # --- int_max_str_digits immunity ----------------------------------------
 from weft.validators import dec_str_to_int
 check("chunked int conversion", dec_str_to_int("1" + "0" * 5000) == 10 ** 5000)

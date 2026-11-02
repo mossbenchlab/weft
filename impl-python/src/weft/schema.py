@@ -125,7 +125,7 @@ def load_schema(text: str) -> SchemaRegistry:
         forms = [x for x in tree.items if isinstance(x, Sexpr) and x.tag.name == "schema"]
     for form in forms:
         if not isinstance(form, Sexpr) or form.tag.name != "schema":
-            raise WeftSchemaError(f"expected (schema ...), got {form!r}", code="WEFT_SCHEMA_PARSE")
+            raise WeftSchemaError(f"expected (schema ...), got {_diag(form)}", code="WEFT_SCHEMA_PARSE")
         sd = _parse_schema_form(form)
         registry.schemas[sd.name] = sd
     return registry
@@ -140,7 +140,7 @@ def _parse_schema_form(form: Sexpr) -> SchemaDef:
     fields: List[Field] = []
     for item in form.items[1:]:
         if not isinstance(item, Sexpr) or item.tag.name != "field":
-            raise WeftSchemaError(f"expected (field ...), got {item!r}", code="WEFT_SCHEMA_PARSE")
+            raise WeftSchemaError(f"expected (field ...), got {_diag(item)}", code="WEFT_SCHEMA_PARSE")
         fields.append(_parse_field(item))
     return SchemaDef(name=name_node.name, fields=fields)
 
@@ -301,7 +301,7 @@ def _validate_record(
         before = len(violations)
         yield _validate_against_type(ctx, val, field.type_, fpath, violations)
         if len(violations) == before:
-            _apply_constraints(val, field.constraints, fpath, violations)
+            _apply_constraints(val, field.constraints, fpath, violations, ctx)
     allowed = {f.name for f in sd.fields}
     for key in value.keys():
         if key not in allowed:
@@ -490,87 +490,113 @@ def _to_num(x):
 _NAN_SENTINEL = object()
 
 
-def _weft_equality_key(x):
+def _weft_equality_key(x, ctx=None):
     """Return a hashable key such that two Weft values share the key iff
-    they are **canonically equal** under the following rules (spec §13):
+    they are **canonically equal** (SPEC §5.16):
 
-    * Scalars: equal iff same Weft category **and** same value, except
-      Integer/BigInt which compare numerically (``1`` ≡ ``1n``, §5.4); ``1``
-      and ``1.0`` likewise.
-    * Decimal: equal iff the preserved text form matches
-      (``3.14`` ≠ ``3.140``).
-    * Binary: equal iff the content bytes match. The ``base64``/``hex``
-      flag is a presentation hint only.
-    * Float NaN: every NaN is distinct from every other value, including
-      itself and other NaNs; the key uses a fresh sentinel each time.
-    * Composites (list / map / sexpr / typed): walked recursively using
-      the same rules. Map key order is normalised (``{:a 1 :b 2}`` ==
-      ``{:b 2 :a 1}``). A NaN leaf inside a composite still forces
-      inequality.
+    * Integer/BigInt compare numerically (``1`` ≡ ``1n``); the ``n``
+      suffix is a presentation hint.
+    * Decimal: equal iff the normalised text matches (``3.14`` ≠ ``3.140``).
+    * Binary: equal iff the content bytes match (encoding is a hint).
+    * Float: IEEE-754 bit identity (``-0.0`` ≠ ``0.0``); any NaN —
+      including inside a composite — makes the value unequal to
+      everything, so the key is a fresh sentinel object.
+    * Map key order is normalised; composites compare structurally.
+
+    Two properties matter for hostile input, and both are why the key is
+    a flat **string** built iteratively rather than a nested tuple of raw
+    ints:
+
+    * CPython hashes ``int`` as the value mod 2^61-1 — an attacker can
+      mint unlimited distinct integers with identical hashes and turn a
+      ``:unique`` set into quadratic probing. Strings hash with the
+      process-keyed SipHash, which hostile input cannot target. Integers
+      are therefore keyed by their decimal text.
+    * The walk uses an explicit stack, so a deep (but §9-admitted) value
+      cannot overflow the host stack. Each visited node counts against
+      the validation step budget when a ctx is supplied.
+
+    Tokens are length-prefixed (netstring style), so distinct structures
+    cannot collide by concatenation.
     """
     import math as _math
-    if x is None:
-        return ("null",)
-    if isinstance(x, bool):
-        return ("bool", x)
-    # Weft Integer is one abstract type: SPEC §5.4 says ``42`` and ``42n``
-    # denote the same value. The ``n`` suffix is a presentation hint
-    # (preserved for round-trip of the exact source form), not a type
-    # tag — so ``int`` and ``BigInt`` share the same equality key.
-    if isinstance(x, BigInt):
-        return ("int", x.value)
-    if isinstance(x, int):
-        return ("int", x)
-    if isinstance(x, float):
-        if _math.isnan(x):
-            # Fresh sentinel so no two NaN keys ever collide (SPEC §5.16).
-            return ("nan", object())
-        # SPEC §5.16: Float equality is IEEE-754 bit identity, so
-        # -0.0 and 0.0 are distinct values.
-        import struct as _struct
-        return ("float", _struct.pack("<d", x))
-    if isinstance(x, Decimal):
-        return ("decimal", x.text)
-    if isinstance(x, str):
-        return ("string", x)
-    if isinstance(x, Symbol):
-        return ("symbol", x.name)
-    if isinstance(x, Keyword):
-        return ("keyword", x.name)
-    if isinstance(x, Binary):
-        # Encoding is a presentation hint; compare on content bytes.
-        return ("binary", bytes(x.data))
-    if isinstance(x, WeftDate):
-        return ("date", x.year, x.month, x.day, x.has_time, x.hour, x.minute,
-                x.second, x.nano, x.tz_offset_minutes)
-    if isinstance(x, _dt.datetime):
-        return ("date-std", x.isoformat())
-    if isinstance(x, _dt.date):
-        return ("date-std", x.isoformat())
-    if isinstance(x, list):
-        return ("list", tuple(_weft_equality_key(it) for it in x))
-    if isinstance(x, dict):
-        # Sort by key so order doesn't affect identity.
-        items = sorted(x.items(), key=lambda kv: kv[0])
-        return ("map", tuple((k, _weft_equality_key(v)) for k, v in items))
-    if isinstance(x, Sexpr):
-        return ("sexpr", x.tag.name,
-                tuple(_weft_equality_key(it) for it in x.items))
-    if isinstance(x, Typed):
-        return ("typed",
-                _weft_equality_key(x.type),
-                _weft_equality_key(x.value))
-    return ("other", repr(x))
+    import struct as _struct
+    from .jsonio import int_to_dec_str
+
+    parts: List[str] = []
+    stack = [x]
+    while stack:
+        node = stack.pop()
+        if ctx is not None:
+            ctx.step()
+        if node is None:
+            parts.append("z;")
+        elif node is True:
+            parts.append("b1;")
+        elif node is False:
+            parts.append("b0;")
+        elif isinstance(node, BigInt):
+            s = int_to_dec_str(node.value)
+            parts.append(f"i{len(s)}:{s}")
+        elif isinstance(node, int):
+            s = int_to_dec_str(node)
+            parts.append(f"i{len(s)}:{s}")
+        elif isinstance(node, float):
+            if _math.isnan(node):
+                # NaN is unequal to everything, itself included — the
+                # whole value gets a globally unique identity key.
+                return object()
+            parts.append("f" + _struct.pack("<d", node).hex() + ";")
+        elif isinstance(node, Decimal):
+            parts.append(f"d{len(node.text)}:{node.text}")
+        elif isinstance(node, str):
+            parts.append(f"s{len(node)}:{node}")
+        elif isinstance(node, Symbol):
+            parts.append(f"y{len(node.name)}:{node.name}")
+        elif isinstance(node, Keyword):
+            parts.append(f"w{len(node.name)}:{node.name}")
+        elif isinstance(node, Binary):
+            h = bytes(node.data).hex()
+            parts.append(f"n{len(h)}:{h}")
+        elif isinstance(node, WeftDate):
+            t = (f"{node.year},{node.month},{node.day},{node.has_time},"
+                 f"{node.hour},{node.minute},{node.second},{node.nano},"
+                 f"{node.tz_offset_minutes}")
+            parts.append(f"D{len(t)}:{t}")
+        elif isinstance(node, (_dt.datetime, _dt.date)):
+            t = node.isoformat()
+            parts.append(f"E{len(t)}:{t}")
+        elif isinstance(node, list):
+            parts.append(f"L{len(node)};")
+            stack.extend(reversed(node))
+        elif isinstance(node, dict):
+            parts.append(f"M{len(node)};")
+            for k in sorted(node.keys(), reverse=True):
+                stack.append(node[k])
+                stack.append(("#key", k))
+        elif isinstance(node, Sexpr):
+            parts.append(f"X{len(node.items)};y{len(node.tag.name)}:{node.tag.name}")
+            stack.extend(reversed(node.items))
+        elif isinstance(node, Typed):
+            parts.append("T;")
+            stack.append(node.value)
+            stack.append(node.type)
+        elif isinstance(node, tuple) and len(node) == 2 and node[0] == "#key":
+            k = node[1]
+            parts.append(f"k{len(k)}:{k}")
+        else:
+            parts.append(f"o{_diag(node)};")
+    return "".join(parts)
 
 
-def _apply_constraints(value, constraints, path, violations):
+def _apply_constraints(value, constraints, path, violations, ctx=None):
     import math as _math
     for k, v in constraints.items():
         if k in ("min", "max", "exclusive-min", "exclusive-max"):
             # NaN never satisfies any numeric bound — spec §9.3.
             if isinstance(value, float) and _math.isnan(value):
                 code = "WEFT_SCHEMA_MIN" if k in ("min", "exclusive-min") else "WEFT_SCHEMA_MAX"
-                violations.append(Violation(path, code, f"NaN is not within numeric bound {k}={v}"))
+                violations.append(Violation(path, code, f"NaN is not within numeric bound {k}={_diag(v)}"))
                 continue
             num_val = _to_num(value)
             num_lim = _to_num(v)
@@ -586,11 +612,13 @@ def _apply_constraints(value, constraints, path, violations):
             elif k == "exclusive-max" and not (num_val < num_lim):
                 violations.append(Violation(path, "WEFT_SCHEMA_MAX", f"{_diag(value)} not < {_diag(v)}"))
         elif k == "min-length":
-            if hasattr(value, "__len__") and len(value) < v:
-                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"length {len(value)} < {v}"))
+            vn = v.value if isinstance(v, BigInt) else v
+            if hasattr(value, "__len__") and len(value) < vn:
+                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"length {len(value)} < {_diag(v)}"))
         elif k == "max-length":
-            if hasattr(value, "__len__") and len(value) > v:
-                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"length {len(value)} > {v}"))
+            vn = v.value if isinstance(v, BigInt) else v
+            if hasattr(value, "__len__") and len(value) > vn:
+                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"length {len(value)} > {_diag(v)}"))
         elif k == "pattern":
             if isinstance(value, str):
                 try:
@@ -599,16 +627,18 @@ def _apply_constraints(value, constraints, path, violations):
                 except WeftSchemaError as e:
                     violations.append(Violation(path, "WEFT_SCHEMA_PATTERN", f"invalid pattern: {e}"))
         elif k == "items-min":
-            if isinstance(value, list) and len(value) < v:
-                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"items {len(value)} < {v}"))
+            vn = v.value if isinstance(v, BigInt) else v
+            if isinstance(value, list) and len(value) < vn:
+                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"items {len(value)} < {_diag(v)}"))
         elif k == "items-max":
-            if isinstance(value, list) and len(value) > v:
-                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"items {len(value)} > {v}"))
+            vn = v.value if isinstance(v, BigInt) else v
+            if isinstance(value, list) and len(value) > vn:
+                violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"items {len(value)} > {_diag(v)}"))
         elif k == "unique":
             if isinstance(value, list) and v:
                 seen = set()
                 for i, x in enumerate(value):
-                    key = _weft_equality_key(x)
+                    key = _weft_equality_key(x, ctx)
                     if key in seen:
                         violations.append(Violation(f"{path}[{i}]", "WEFT_SCHEMA_UNIQUE", f"duplicate value {_diag(x)}"))
                     else:
