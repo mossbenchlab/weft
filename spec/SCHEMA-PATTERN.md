@@ -34,13 +34,18 @@ string. `fullmatch` returns a boolean; capture groups do not exist.
 | `\.` etc. | escaped punctuation is that literal character |
 | `[...]` / `[^...]` | character class; ranges `a-z`; class escapes allowed; a single-code-point escape (e.g. `\x61`) is a valid range endpoint, a multi-character class (`\d`) is not |
 | `e*` `e+` `e?` | repetition (a trailing `?` lazy marker is accepted and ignored — greediness cannot change a boolean full match) |
-| `e{m}` `e{m,}` `e{m,n}` | counted repetition, ASCII digits only, each count ≤ 1000 |
+| `e{m}` `e{m,}` `e{m,n}` `e{,n}` `e{,}` | counted repetition, ASCII digits only; an omitted `m` is 0, an omitted `n` is unbounded; each count (its value after ignoring leading zeros) ≤ 1000 |
 | `(...)` and `(?:...)` | grouping (identical semantics — no captures) |
 | `a\|b` | alternation |
 | `^` / `$` | assert start / end of input (redundant under full-match but accepted anywhere) |
 
-A `{` that does not form a well-formed counted repetition is a literal
-`{` (same behavior as mainstream engines).
+A `{` that does not lex as one of the counted-repetition forms above is
+a literal `{` (same behavior as mainstream engines). **Order matters:**
+whether the brace sequence is well-formed is decided by lexing alone,
+BEFORE the count limit applies — `a{1001,x}` is the literal text
+`a{1001,x}`, while the well-formed `a{1001}` is rejected with
+`WEFT_SCHEMA_PATTERN` for exceeding the count limit. Leading zeros do
+not count toward the limit (`{00000001}` is count 1).
 
 ## Rejected at compile time (`WEFT_SCHEMA_PATTERN`)
 

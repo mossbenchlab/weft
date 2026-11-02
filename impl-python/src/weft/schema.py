@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from . import repat as _repat
+from ._trampoline import drive as _vdrive
 from .errors import WeftSchemaError
 from .parser import parse
 from .types import BigInt, Binary, Decimal, Keyword, Sexpr, Symbol, Typed, WeftDate
@@ -36,6 +37,37 @@ def _compiled_pattern(src_pat: str) -> "_repat.Pattern":
         if len(_PATTERN_CACHE) < 1024:
             _PATTERN_CACHE[src_pat] = p
     return p
+
+
+def _diag(v, limit: int = 64) -> str:
+    """Render a value for a diagnostic message without host traps: a
+    huge int must not hit CPython's int_max_str_digits ValueError
+    (``f"{value}"`` does), and containers must not drag such ints in
+    through repr. Output is length-capped — diagnostics identify, they
+    don't reproduce."""
+    from .jsonio import int_to_dec_str
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, BigInt):
+        s = int_to_dec_str(v.value) + "n"
+    elif isinstance(v, int):
+        s = int_to_dec_str(v)
+    elif isinstance(v, str):
+        s = repr(v)
+    elif isinstance(v, list):
+        return f"<list of {len(v)} items>"
+    elif isinstance(v, dict):
+        return f"<map of {len(v)} entries>"
+    else:
+        try:
+            s = repr(v)
+        except Exception:
+            return f"<{type(v).__name__}>"
+    if len(s) > limit:
+        s = s[: limit // 2] + f"...({len(s)} chars)"
+    return s
 
 
 class SchemaError(WeftSchemaError):
@@ -182,18 +214,77 @@ def _parse_field(form: Sexpr) -> Field:
 # Validation
 # --------------------------------------------------------------------------
 
+_MAX_VALIDATION_STEPS = 2_000_000
+
+
+class _VCtx:
+    """Per-validate() state: the registry, a (value, type) result memo,
+    and an explicit work budget.
+
+    The memo makes validation polynomial — O(container values x type
+    nodes) — where a naive Union retries the same subtree against the
+    same type exponentially ((Union R R) doubles the work per nesting
+    level). Only container values (map/list/sexpr) are memoized: they
+    have unique object identities in a parsed tree, whereas small ints
+    and strings may be interned by the host and shared across paths.
+    Memo entries hold violations with paths RELATIVE to the validation
+    root of that entry, re-prefixed on replay.
+
+    The step budget is the backstop the memo cannot be: it bounds total
+    validation work outright, so no schema/document pair can consume
+    unbounded CPU (WEFT_SCHEMA_BUDGET)."""
+
+    __slots__ = ("registry", "memo", "steps")
+
+    def __init__(self, registry: SchemaRegistry):
+        self.registry = registry
+        self.memo: dict = {}
+        self.steps = 0
+
+    def step(self) -> None:
+        self.steps += 1
+        if self.steps > _MAX_VALIDATION_STEPS:
+            raise WeftSchemaError(
+                f"schema validation exceeded {_MAX_VALIDATION_STEPS} steps "
+                "(schema/document combination too expensive)",
+                code="WEFT_SCHEMA_BUDGET")
+
+
+def _type_key(type_expr):
+    """Memo key component for a type expression. Record references and
+    primitive names key by name (two Symbols naming the same record hit
+    the same entry); structural Sexpr type expressions key by node
+    identity (the schema tree is fixed for the whole validate call)."""
+    if isinstance(type_expr, Symbol):
+        return ("s", type_expr.name)
+    return ("x", id(type_expr))
+
+
+def _join_path(base: str, rel: str) -> str:
+    if not rel:
+        return base
+    if not base:
+        return rel
+    if rel[0] in "[#":
+        return base + rel
+    return base + "." + rel
+
+
 def validate(registry: SchemaRegistry, document: Any, root_schema: str) -> List[Violation]:
     if root_schema not in registry.schemas:
         return [Violation("", "WEFT_SCHEMA_RECORD", f"schema {root_schema!r} not defined")]
     violations: List[Violation] = []
-    _validate_record(registry, document, registry.schemas[root_schema], root_schema, violations)
+    ctx = _VCtx(registry)
+    _vdrive(_validate_record(ctx, document, registry.schemas[root_schema], root_schema, violations))
     return violations
 
 
 def _validate_record(
-    registry: SchemaRegistry, value: Any, sd: SchemaDef,
+    ctx: "_VCtx", value: Any, sd: SchemaDef,
     path: str, violations: List[Violation],
-) -> None:
+):
+    """Step generator (run via weft._trampoline.drive)."""
+    ctx.step()
     if not isinstance(value, dict):
         violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"expected record (map), got {_type_name(value)}"))
         return
@@ -208,7 +299,7 @@ def _validate_record(
         # on something that is not numeric is noise at best and a crash at
         # worst — a type violation already names the real problem.
         before = len(violations)
-        _validate_against_type(registry, val, field.type_, fpath, violations)
+        yield _validate_against_type(ctx, val, field.type_, fpath, violations)
         if len(violations) == before:
             _apply_constraints(val, field.constraints, fpath, violations)
     allowed = {f.name for f in sd.fields}
@@ -218,7 +309,30 @@ def _validate_record(
             violations.append(Violation(fpath, "WEFT_SCHEMA_UNKNOWN_FIELD", f"unknown field {key!r}"))
 
 
-def _validate_against_type(registry, value, type_expr, path, violations):
+def _validate_against_type(ctx, value, type_expr, path, violations):
+    """Step generator. Container values are validated once per
+    (value identity, type) and replayed from the memo afterwards —
+    see _VCtx."""
+    ctx.step()
+    registry = ctx.registry
+    if isinstance(value, (dict, list, Sexpr)):
+        key = (id(value), _type_key(type_expr))
+        hit = ctx.memo.get(key)
+        if hit is not None:
+            for rel, code, msg in hit:
+                violations.append(Violation(_join_path(path, rel), code, msg))
+            return
+        local: List[Violation] = []
+        yield _validate_against_type_inner(ctx, value, type_expr, "", local)
+        ctx.memo[key] = tuple((v.path, v.code, v.message) for v in local)
+        for v in local:
+            violations.append(Violation(_join_path(path, v.path), v.code, v.message))
+        return
+    yield _validate_against_type_inner(ctx, value, type_expr, path, violations)
+
+
+def _validate_against_type_inner(ctx, value, type_expr, path, violations):
+    registry = ctx.registry
     # Primitive symbol types
     if isinstance(type_expr, Symbol):
         name = type_expr.name
@@ -266,7 +380,7 @@ def _validate_against_type(registry, value, type_expr, path, violations):
             return
         # Record reference
         if name in registry.schemas:
-            _validate_record(registry, value, registry.schemas[name], path, violations)
+            yield _validate_record(ctx, value, registry.schemas[name], path, violations)
             return
         violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"unknown type {name!r}"))
         return
@@ -281,7 +395,7 @@ def _validate_against_type(registry, value, type_expr, path, violations):
                 return
             item_type = type_expr.items[0]
             for i, v in enumerate(value):
-                _validate_against_type(registry, v, item_type, f"{path}[{i}]", violations)
+                yield _validate_against_type(ctx, v, item_type, f"{path}[{i}]", violations)
             return
         if tag == "Map":
             if not isinstance(value, dict):
@@ -291,19 +405,19 @@ def _validate_against_type(registry, value, type_expr, path, violations):
                 return
             value_type = type_expr.items[1]
             for k, v in value.items():
-                _validate_against_type(registry, v, value_type, f"{path}.{k}", violations)
+                yield _validate_against_type(ctx, v, value_type, _join_path(path, k), violations)
             return
         if tag == "Optional":
             if value is None:
                 return
             if type_expr.items:
-                _validate_against_type(registry, value, type_expr.items[0], path, violations)
+                yield _validate_against_type(ctx, value, type_expr.items[0], path, violations)
             return
         if tag == "Union":
             saved = list(violations)
             for alt in type_expr.items:
                 local: List[Violation] = []
-                _validate_against_type(registry, value, alt, path, local)
+                yield _validate_against_type(ctx, value, alt, path, local)
                 if not local:
                     violations[:] = saved
                     return
@@ -315,7 +429,7 @@ def _validate_against_type(registry, value, type_expr, path, violations):
                 return
             allowed = [x for x in type_expr.items if isinstance(x, str)]
             if value not in allowed:
-                violations.append(Violation(path, "WEFT_SCHEMA_ENUM", f"must be one of {allowed}, got {value!r}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_ENUM", f"must be one of {allowed}, got {_diag(value)}"))
             return
         if tag == "Tuple":
             if not isinstance(value, list):
@@ -325,7 +439,7 @@ def _validate_against_type(registry, value, type_expr, path, violations):
                 violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"tuple length mismatch: want {len(type_expr.items)}, got {len(value)}"))
                 return
             for i, (v, t) in enumerate(zip(value, type_expr.items)):
-                _validate_against_type(registry, v, t, f"{path}[{i}]", violations)
+                yield _validate_against_type(ctx, v, t, f"{path}[{i}]", violations)
             return
         if tag == "Sexpr":
             if not isinstance(value, Sexpr):
@@ -342,7 +456,7 @@ def _validate_against_type(registry, value, type_expr, path, violations):
                     violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"sexpr item count mismatch"))
                     return
                 for i, (v, t) in enumerate(zip(value.items, item_types)):
-                    _validate_against_type(registry, v, t, f"{path}#{i}", violations)
+                    yield _validate_against_type(ctx, v, t, f"{path}#{i}", violations)
             return
         violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"unknown compound type {tag!r}"))
         return
@@ -461,16 +575,16 @@ def _apply_constraints(value, constraints, path, violations):
             num_val = _to_num(value)
             num_lim = _to_num(v)
             if num_val is None or num_lim is None:
-                violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"cannot compare {value!r} with {v!r}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_TYPE", f"cannot compare {_diag(value)} with {_diag(v)}"))
                 continue
             if k == "min" and num_val < num_lim:
-                violations.append(Violation(path, "WEFT_SCHEMA_MIN", f"{value} < {v}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_MIN", f"{_diag(value)} < {_diag(v)}"))
             elif k == "max" and num_val > num_lim:
-                violations.append(Violation(path, "WEFT_SCHEMA_MAX", f"{value} > {v}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_MAX", f"{_diag(value)} > {_diag(v)}"))
             elif k == "exclusive-min" and not (num_val > num_lim):
-                violations.append(Violation(path, "WEFT_SCHEMA_MIN", f"{value} not > {v}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_MIN", f"{_diag(value)} not > {_diag(v)}"))
             elif k == "exclusive-max" and not (num_val < num_lim):
-                violations.append(Violation(path, "WEFT_SCHEMA_MAX", f"{value} not < {v}"))
+                violations.append(Violation(path, "WEFT_SCHEMA_MAX", f"{_diag(value)} not < {_diag(v)}"))
         elif k == "min-length":
             if hasattr(value, "__len__") and len(value) < v:
                 violations.append(Violation(path, "WEFT_SCHEMA_LEN", f"length {len(value)} < {v}"))
@@ -496,7 +610,7 @@ def _apply_constraints(value, constraints, path, violations):
                 for i, x in enumerate(value):
                     key = _weft_equality_key(x)
                     if key in seen:
-                        violations.append(Violation(f"{path}[{i}]", "WEFT_SCHEMA_UNIQUE", f"duplicate value {x!r}"))
+                        violations.append(Violation(f"{path}[{i}]", "WEFT_SCHEMA_UNIQUE", f"duplicate value {_diag(x)}"))
                     else:
                         seen.add(key)
 

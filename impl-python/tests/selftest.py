@@ -188,6 +188,58 @@ check("1024-deep dumps/loads cycle (iterative JSON IO)",
       weft.equals(_deepdoc, weft.loads_json(weft.dumps_json(_deepdoc),
                                             limits=Limits(max_depth=1024))))
 
+# --- 1.0.1-rc4 regressions (schema validator) --------------------------------
+import time as _t2
+from weft.schema import load_schema as _ls, validate as _val
+import weft.schema as _schema_mod
+
+# R5-1: recursive Union is polynomial (memoized), not exponential
+_r = _ls("(schema R (field x (Union R R)))")
+_d = weft.parse("{:x " * 60 + "0" + "}" * 60)
+_t0 = _t2.monotonic()
+_v = _val(_r, _d, "R")
+check("recursive Union depth-60 validates fast",
+      _t2.monotonic() - _t0 < 1.0 and len(_v) == 1)
+
+# R5-2: schema-depth x doc-depth never leaks RecursionError
+_r2 = _ls("(schema R (field x " + "(Optional " * 60 + "(Union Int R)" + ")" * 60 + "))")
+check("Optional x60 over depth-20 doc: no violations, no crash",
+      _val(_r2, weft.parse("{:x " * 20 + "0" + "}" * 20), "R") == [])
+_r3 = _ls("(schema R (field x (Union Int R)))")
+_d3 = weft.parse("[" * 0 + "{:x " * 500 + "0" + "}" * 500, limits=Limits(max_depth=1024))
+check("validation of depth-500 doc (max_depth=1024)",
+      _val(_r3, _d3, "R") == [])
+
+# R5-3: huge ints in diagnostics never raise host ValueError
+_r4 = _ls("(schema R (field x Int :max 0))")
+_v4 = _val(_r4, weft.parse("{:x " + "9" * 4301 + "}"), "R")
+check("4301-digit int in :max diagnostic", len(_v4) == 1 and _v4[0].code == "WEFT_SCHEMA_MAX")
+_r5 = _ls("(schema R (field x (List Int) :unique true))")
+_big = "9" * 4301
+check("4301-digit dup in :unique diagnostic",
+      len(_val(_r5, weft.parse("{:x [" + _big + " " + _big + "]}"), "R")) == 1)
+
+# step budget is enforced (lowered temporarily)
+_saved_budget = _schema_mod._MAX_VALIDATION_STEPS
+try:
+    _schema_mod._MAX_VALIDATION_STEPS = 50
+    try:
+        _val(_r, weft.parse("{:x " * 30 + "0" + "}" * 30), "R")
+        check("validation step budget enforced", False)
+    except weft.WeftError as e:
+        check("validation step budget enforced", e.code == "WEFT_SCHEMA_BUDGET")
+finally:
+    _schema_mod._MAX_VALIDATION_STEPS = _saved_budget
+
+# R5-4: counted-repeat lexing matches SCHEMA-PATTERN.md
+check("leading-zero repeat count", compile_pattern("a{00000001}").fullmatch("a"))
+check("non-well-formed brace is literal",
+      compile_pattern("a{1001,x}").fullmatch("a{1001,x}"))
+check("{,n} supported", compile_pattern("a{,2}").fullmatch("aa")
+      and not compile_pattern("a{,2}").fullmatch("aaa"))
+expect_err("well-formed over-limit count rejected",
+           lambda: compile_pattern("a{1001}"))
+
 # --- int_max_str_digits immunity ----------------------------------------
 from weft.validators import dec_str_to_int
 check("chunked int conversion", dec_str_to_int("1" + "0" * 5000) == 10 ** 5000)

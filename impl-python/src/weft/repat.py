@@ -225,45 +225,60 @@ class Pattern:
             raise _err("nested bare quantifier (e.g. 'a++'); group the inner repeat")
         return frag
 
-    def _digits(self) -> str:
+    def _lex_digits(self) -> str:
         """Read a run of ASCII digits ('0'-'9' only — host .isdigit()
-        accepts non-ASCII digits that int() then rejects)."""
+        accepts non-ASCII digits that int() then rejects). No length cap
+        here: the pattern source is already capped, and whether the run
+        is part of a well-formed counted repeat is decided by the
+        caller BEFORE any count limit applies."""
         out = ""
         while True:
             ch = self._peek()
             if ch is None or ch not in _ASCII_DIGITS:
                 return out
             out += self._take()
-            if len(out) > 7:  # far beyond MAX_REPEAT; refuse before int()
-                raise _err(f"repeat count exceeds {MAX_REPEAT}")
 
     def _braces(self):
-        # at '{'; returns (lo, hi) or (None, None) if not a counted repeat
+        # At '{'. First decide, by lexing alone, whether this is a
+        # well-formed counted repeat — {m} {m,} {m,n} {,n} {,} with
+        # ASCII digits. Anything else is a literal '{' (the caller
+        # rewinds); count limits are applied only AFTER the form is
+        # established, so "a{1001,x}" is the literal text, never a
+        # count error (SCHEMA-PATTERN.md).
         assert self._take() == "{"
-        digits = self._digits()
-        if self._peek() == "}":
-            if not digits:
-                return (None, None)
+        d1 = self._lex_digits()
+        has_comma = False
+        d2 = ""
+        if self._peek() == ",":
             self._take()
-            n = int(digits)
-            self._check_rep(n)
-            return (n, n)
-        if self._peek() != ",":
-            return (None, None)
-        self._take()
-        lo = int(digits) if digits else 0
-        self._check_rep(lo)
-        digits2 = self._digits()
+            has_comma = True
+            d2 = self._lex_digits()
         if self._peek() != "}":
             return (None, None)
-        self._take()
-        if digits2:
-            hi = int(digits2)
-            self._check_rep(hi)
+        if not d1 and not has_comma:
+            return (None, None)  # "{}"
+        self._take()  # '}'
+        lo = self._count(d1) if d1 else 0
+        if not has_comma:
+            return (lo, lo)
+        if d2:
+            hi = self._count(d2)
             if hi < lo:
                 raise _err("bad repeat range {m,n} with n < m")
             return (lo, hi)
         return (lo, -1)  # open-ended
+
+    def _count(self, digits: str) -> int:
+        """Numeric value of a repeat count. Leading zeros are ignored
+        for the limit check ("{00000001}" is count 1); the significant
+        digits are length-capped before int() so the host's big-int
+        string-conversion guard is never reached."""
+        t = digits.lstrip("0")
+        if len(t) > 4:  # MAX_REPEAT is 4 digits
+            raise _err(f"repeat count exceeds {MAX_REPEAT}")
+        n = int(t) if t else 0
+        self._check_rep(n)
+        return n
 
     @staticmethod
     def _check_rep(n: int) -> None:

@@ -255,3 +255,39 @@ verified by the four-implementation differential harness
 - Self-tests: hostile-pattern battery, concurrent deep+shallow parse
   check (recursion limit must stay untouched), digit-boundary checks,
   long-identifier JSON roundtrip, total-items parity.
+
+## 1.0.1-rc4 (external review round 5 fixes — schema validator)
+
+Round 5 found no new issues in the core (parser / JSON / formatter /
+pattern engine); all four findings were in the Python schema validator,
+untouched since the original review target.
+
+### P1
+- **Recursive Union validation is polynomial now.** Validation runs
+  under a per-call context with a (container value, type) result memo —
+  `(Union R R)` used to double the work per nesting level (a 111-byte
+  document exceeded a 4 s watchdog at depth 22; depth 200 now validates
+  in ~1 ms). An explicit step budget (`_MAX_VALIDATION_STEPS`,
+  `WEFT_SCHEMA_BUDGET`) bounds total validation work outright as the
+  backstop the memo cannot be. Memoized violations are stored with
+  relative paths and re-prefixed on replay.
+- **Validation no longer recurses on the host stack.** `_validate_record`
+  / `_validate_against_type` run on the same generator trampoline as the
+  parser, so schema-type depth x document depth can no longer multiply
+  into a RecursionError (the Optional x60 / depth-20 reviewer case now
+  returns 0 violations; depth-500 documents under max_depth=1024
+  validate cleanly).
+
+### P2
+- **Diagnostics are host-safe.** `:min`/`:max`/`:unique`/Enum messages
+  render values through a capped `_diag()` helper (ints via the
+  Decimal-based converter), so a 4,301-digit integer in a document or a
+  schema bound produces a normal violation instead of leaking CPython's
+  `int_max_str_digits` ValueError — including through the CLI.
+- **Counted-repeat lexing matches the norm.** `{...}` is first lexed
+  completely; only a well-formed form is a counted repeat (`a{1001,x}`
+  is literal text), count limits apply after ignoring leading zeros
+  (`{00000001}` is count 1), and `{,n}` / `{,}` are now documented in
+  SCHEMA-PATTERN.md as supported with `m` defaulting to 0.
+- Fixed a path-join bug for Map values validated at a memo root
+  (`R.x..k` → `R.x.k`).
