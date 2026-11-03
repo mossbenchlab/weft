@@ -1,6 +1,6 @@
 # Weft 1.0 — Specification
 
-**Status**: Stable (v1.0, spec revision 1.0.1)
+**Status**: Stable (v1.0, spec revision 1.0.2)
 **Last updated**: 2026-11-02
 **Authors**: mossbenchlab and Claude
 
