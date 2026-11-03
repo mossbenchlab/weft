@@ -38,6 +38,7 @@ pub struct Token {
     pub offset: usize,
 }
 
+#[derive(Debug)]
 pub struct Lexer<'a> {
     text: &'a str,
     chars: Vec<(usize, char)>,

@@ -1,7 +1,7 @@
 {
   "name": "weft-format",
-  "version": "1.0.1",
-  "description": "Weft \u2014 AI-first textual data format (TypeScript reference implementation). Parse, format (byte-identical canonical form), lossless JSON bridge.",
+  "version": "1.0.2",
+  "description": "Weft \u2014 AI-first textual data format (TypeScript reference implementation). Parse, format (byte-identical strict-canonical output), lossless JSON bridge.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

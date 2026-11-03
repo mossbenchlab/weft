@@ -22,5 +22,5 @@ pub use parser::{parse, parse_stream};
 pub use formatter::{format_value, format_inline, FormatOptions};
 pub use json::{to_json, to_json_lossless, from_json, from_json_with_limits, from_json_lossless, from_json_lossless_with_limits, loads_json, loads_json_lossless, parse_json_lexical, JsonLex};
 
-pub const VERSION: &str = "1.0.1";
+pub const VERSION: &str = "1.0.2";
 pub const SPEC_VERSION: &str = "1.0";

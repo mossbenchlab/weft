@@ -2,7 +2,7 @@
 
 Rust reference implementation of **Weft 1.0**, an AI-first textual data
 format: rich types (BigInt, Decimal, Binary, DateTime, Symbol, Keyword,
-typed values), one byte-identical canonical form across implementations
+typed values), byte-identical strict-canonical output across implementations
 (safe to hash and sign), a lossless JSON bridge, and parsing hardened
 against hostile input.
 

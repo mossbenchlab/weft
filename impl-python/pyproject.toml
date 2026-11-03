@@ -1,44 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "weft-format"
-version = "1.0.1"
-description = "Weft — AI-first textual data format (Python reference implementation). Parse, format (byte-identical canonical form), lossless JSON bridge, schema validation."
-readme = {text = """
-# weft-format
-
-Python reference implementation of **Weft 1.0**, an AI-first textual
-data format: rich types (BigInt, Decimal, Binary, DateTime, Symbol,
-Keyword, typed values), one byte-identical canonical form across
-implementations (safe to hash and sign), a lossless JSON bridge, and
-parsers hardened against hostile input.
-
-```python
-import weft
-
-v = weft.parse('{:name "weft" :precise 0.1m :big 9007199254740993n}')
-print(weft.format_value(v, weft.FormatOptions(strict_canonical=True)))
-j = weft.dumps_json(v)            # lossless JSON encoding
-assert weft.equals(v, weft.loads_json(j))
-```
-
-The import name is `weft` (the distribution is `weft-format` because
-the name `weft` was taken on PyPI by an unrelated project).
-
-Specification, three more reference implementations (TypeScript, Rust,
-Go), and the conformance suite:
-https://github.com/mossbenchlab/weft
-""", content-type = "text/markdown"}
+version = "1.0.2"
+description = "Weft — AI-first textual data format (Python reference implementation). Parse, format (byte-identical strict-canonical output), lossless JSON bridge, schema validation."
+readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "mossbenchlab"}]
 keywords = ["weft", "serialization", "data-format", "canonical", "json", "ai"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

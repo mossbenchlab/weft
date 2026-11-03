@@ -7,3 +7,4 @@ target/
 tests/conformance/drivers/tsout/
 tests/conformance/drivers/bin-go
 tests/conformance/drivers/globals.d.ts
+*.egg-info/

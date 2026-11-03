@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.2 — 2026-11-03
+
+Packaging-only release. No behaviour changes; the format, the public APIs
+and the canonical form are identical to 1.0.1.
+
+- **TypeScript**: added `impl-typescript/README.md` so the npm package page
+  (`weft-format`) shows a description and usage example.
+- **Python**: `pyproject.toml` license metadata moved to the SPDX string
+  form (`license = "MIT"`, classifier removed), silencing the setuptools
+  deprecation warning at build time.
+- **Rust**: removed two unused internal functions
+  (`format_string_triple`, `hex_encode`) and derived `Debug` for `Lexer`,
+  so the crate compiles with zero warnings.
+- Package descriptions and READMEs now say “byte-identical strict-canonical
+  output” (the byte-identical guarantee applies to strict-canonical mode);
+  Python build requirement raised to `setuptools>=77.0.3`, the first
+  version that understands the SPDX license string.
+- Version constants bumped to 1.0.2 in all four implementations.
+
 ## 1.0.1 — 2026-11-02
 
 Security- and conformance-focused revision. No new syntax. All changes

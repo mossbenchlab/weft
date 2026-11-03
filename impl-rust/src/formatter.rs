@@ -361,29 +361,6 @@ fn format_string_dquote(s: &str, opts: FormatOptions) -> Result<String, FormatEr
     out.push('"');
     Ok(out)
 }
-
-fn format_string_triple(s: &str, opts: FormatOptions) -> String {
-    // Fall back to dquote when the triple form would be ambiguous:
-    //   - the string contains ``"""`` (would prematurely close)
-    //   - the string ends in ``"`` (would merge with the closing ``"""``
-    //     into ``""""`` and be unparseable)
-    //   - strict canonical mode is requested
-    if s.contains("\"\"\"") || s.ends_with('"') || opts.strict_canonical {
-        return format_string_dquote(s, FormatOptions { strict_canonical: true, ..opts }).unwrap_or_default();
-    }
-    let mut out = String::with_capacity(s.len() + 6);
-    out.push_str("\"\"\"");
-    for ch in s.chars() {
-        let cp = ch as u32;
-        if ch == '\n' || ch == '\t' { out.push(ch); }
-        else if ch == '\\' { out.push_str("\\\\"); }
-        else if cp < 0x20 && ch != '\r' { write!(out, "\\u{{{:X}}}", cp).unwrap(); }
-        else { out.push(ch); }
-    }
-    out.push_str("\"\"\"");
-    out
-}
-
 fn format_date(d: &WeftDate) -> String {
     let mut s = format!("#{:04}-{:02}-{:02}", d.year, d.month, d.day);
     if !d.has_time { return s; }
@@ -404,13 +381,6 @@ fn format_date(d: &WeftDate) -> String {
     }
     s
 }
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes { write!(s, "{:02x}", b).unwrap(); }
-    s
-}
-
 fn format_list_multi(items: &[Value], depth: usize, opts: FormatOptions) -> String {
     if items.is_empty() { return "[]".into(); }
     let pad_inner = " ".repeat((depth + 1) * opts.indent);

@@ -1,8 +1,8 @@
 [package]
 name = "weft-format"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
-description = "Weft — AI-first textual data format (Rust reference implementation): parse, byte-identical canonical formatting, lossless JSON bridge"
+description = "Weft — AI-first textual data format (Rust reference implementation): parse, byte-identical strict-canonical formatting, lossless JSON bridge"
 license = "MIT"
 repository = "https://github.com/mossbenchlab/weft"
 homepage = "https://github.com/mossbenchlab/weft"
