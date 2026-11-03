@@ -1,9 +1,22 @@
 [package]
-name = "weft"
+name = "weft-format"
 version = "1.0.1"
 edition = "2021"
-description = "Weft 1.0 — AI-first structured data format (Rust reference implementation)"
+description = "Weft — AI-first textual data format (Rust reference implementation): parse, byte-identical canonical formatting, lossless JSON bridge"
 license = "MIT"
+repository = "https://github.com/mossbenchlab/weft"
+homepage = "https://github.com/mossbenchlab/weft"
+documentation = "https://github.com/mossbenchlab/weft/blob/main/spec/SPEC.md"
+keywords = ["weft", "serialization", "data-format", "canonical", "json"]
+categories = ["encoding", "parser-implementations"]
+readme = "README.md"
+
+[lib]
+# The crate is published as `weft-format` (the name `weft` is taken on
+# crates.io by an unrelated project); the library is still used as
+# `use weft::...`.
+name = "weft"
+path = "src/lib.rs"
 
 [dependencies]
 num-bigint = "0.4"

@@ -1,16 +1,37 @@
 {
-  "name": "weft",
+  "name": "weft-format",
   "version": "1.0.1",
-  "description": "Weft 1.0 \u2014 AI-first structured data format (TypeScript reference implementation)",
+  "description": "Weft \u2014 AI-first textual data format (TypeScript reference implementation). Parse, format (byte-identical canonical form), lossless JSON bridge.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node tests/selftest.js"
+    "test": "node tests/selftest.js",
+    "prepublishOnly": "npm run build && npm test"
   },
   "devDependencies": {
     "typescript": "^5.5",
     "@types/node": "^22"
-  }
+  },
+  "keywords": [
+    "weft",
+    "serialization",
+    "data-format",
+    "canonical",
+    "json",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mossbenchlab/weft.git",
+    "directory": "impl-typescript"
+  },
+  "homepage": "https://github.com/mossbenchlab/weft",
+  "bugs": "https://github.com/mossbenchlab/weft/issues",
+  "author": "mossbenchlab",
+  "files": [
+    "dist",
+    "src"
+  ]
 }

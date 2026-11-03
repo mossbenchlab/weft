@@ -4,7 +4,7 @@ version = "1.0.1"
 edition = "2021"
 
 [dependencies]
-weft = { path = "../../../../impl-rust" }
+weft = { package = "weft-format", path = "../../../../impl-rust" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [[bin]]
